@@ -1,6 +1,11 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 // Bounded per-layer residency of MoE expert weights.
@@ -95,3 +100,98 @@ private:
 // Smallest pool that can serve any ubatch: a ubatch routes at most n_expert_used experts per token, and
 // never more distinct experts than the layer has.
 int32_t llama_moe_min_slots(int32_t n_expert, int32_t n_expert_used, int32_t n_ubatch);
+
+//
+// reading expert weights from the model file
+//
+
+struct llama_moe_io_stats {
+    uint64_t n_read    = 0;  // completed reads
+    uint64_t n_bytes   = 0;  // bytes delivered
+    uint64_t t_read_us = 0;  // wall time spent inside read_many(), including waiting on workers
+};
+
+// one expert's worth of bytes to move from the model file into a destination the caller owns
+struct llama_moe_read_req {
+    size_t   file_idx;
+    uint64_t offset;
+    void *   dst;
+    size_t   size;
+};
+
+// Positional reader over the model file(s) holding expert weights.
+//
+// Reads are positional so that many can be in flight on one descriptor without seek races, and every read
+// is bounds-checked against the file length before it is issued. Interrupted and partial reads are retried;
+// a genuine short read is reported rather than leaving a slot half-written.
+struct llama_moe_reader {
+    llama_moe_reader() = default;
+    ~llama_moe_reader();
+
+    llama_moe_reader(const llama_moe_reader &) = delete;
+    llama_moe_reader & operator=(const llama_moe_reader &) = delete;
+
+    // Duplicate fd and take ownership of the duplicate, so the reader keeps working after the loader has
+    // closed its own handle. size is the file length, used to bounds-check every subsequent read.
+    llama_moe_status add_fd(int fd, uint64_t size, size_t * idx);
+
+    // open by path; for tests and tools
+    llama_moe_status add_path(const char * path, size_t * idx);
+
+    // Read one request. Safe to call concurrently.
+    llama_moe_status read(const llama_moe_read_req & req) const;
+
+    // Read a batch, spreading it over the worker threads. Returns the first error encountered; on error
+    // some requests may not have run, so the caller must treat every destination as undefined.
+    //
+    // One batch at a time: this may not be called concurrently with itself. The calling thread takes part
+    // in the batch, so it completes even if no workers were started.
+    llama_moe_status read_many(const llama_moe_read_req * reqs, size_t n);
+
+    // Start n_threads workers. 0 or 1 keeps everything on the calling thread.
+    llama_moe_status start_workers(int32_t n_threads);
+
+    // Ask outstanding and future work to stop, then join. Safe to call more than once.
+    void shutdown();
+
+    size_t   n_files()             const { return files.size(); }
+    uint64_t file_size(size_t idx) const;
+    int32_t  n_threads()           const { return n_worker; }
+
+    llama_moe_io_stats stats() const;
+    void reset_stats();
+
+private:
+    void worker_loop();
+    // claim and service requests until the batch is exhausted; run by the workers and the calling thread
+    void drain(const llama_moe_read_req * reqs, size_t n);
+
+    struct file_entry {
+        int      fd   = -1;
+        uint64_t size = 0;
+    };
+
+    std::vector<file_entry> files;
+
+    // worker pool; batches are handed out by atomically claiming indices into the current request array
+    std::vector<std::thread> workers;
+    int32_t                  n_worker = 0;
+
+    mutable std::mutex      mtx;
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+
+    const llama_moe_read_req * cur_reqs = nullptr;
+    size_t                     cur_n    = 0;
+    uint64_t                   gen      = 0;  // bumped per batch so workers can tell batches apart
+
+    std::atomic<size_t>   next_idx {0};
+    std::atomic<size_t>   n_done   {0};
+    std::atomic<int>      first_err{(int) LLAMA_MOE_STATUS_OK};
+    std::atomic<bool>     stopping {false};
+
+    // read() is const but accounts for what it moved, so these are mutable and atomic
+    mutable std::atomic<uint64_t> st_n_read {0};
+    mutable std::atomic<uint64_t> st_n_bytes{0};
+    std::atomic<uint64_t>         st_t_read_us{0};
+};

@@ -332,6 +332,263 @@ static void test_status_strings() {
     }
 }
 
+//
+// reader tests
+//
+
+static const size_t TEST_FILE_SIZE = 64 * 1024;
+
+static uint8_t pattern_at(size_t i) {
+    return (uint8_t) ((i * 31u + 7u) & 0xFF);
+}
+
+// a temporary file filled with a deterministic pattern; null if the platform refuses to make one
+static FILE * make_pattern_file() {
+    FILE * f = tmpfile();
+    if (f == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<uint8_t> buf(TEST_FILE_SIZE);
+    for (size_t i = 0; i < buf.size(); i++) {
+        buf[i] = pattern_at(i);
+    }
+
+    if (fwrite(buf.data(), 1, buf.size(), f) != buf.size() || fflush(f) != 0) {
+        fclose(f);
+        return nullptr;
+    }
+
+    return f;
+}
+
+static void test_reader_reads(int32_t n_threads) {
+    printf("test_reader_reads (n_threads=%d)\n", n_threads);
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        llama_moe_reader reader;
+        CHECK(reader.start_workers(n_threads) == LLAMA_MOE_STATUS_OK);
+
+        size_t idx = 999;
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, &idx) == LLAMA_MOE_STATUS_OK);
+        CHECK(idx == 0);
+        CHECK(reader.n_files() == 1);
+        CHECK(reader.file_size(0) == TEST_FILE_SIZE);
+        CHECK(reader.file_size(7) == 0);
+
+        // a batch of disjoint chunks, mimicking several experts read at once
+        const size_t chunk = 1024;
+        const size_t n     = 16;
+
+        std::vector<uint8_t>            dst(chunk * n, 0);
+        std::vector<llama_moe_read_req> reqs;
+
+        for (size_t i = 0; i < n; i++) {
+            // read them out of order so a seek-based implementation would trip
+            const size_t src = ((n - 1) - i) * chunk;
+            reqs.push_back({ 0, (uint64_t) src, dst.data() + i * chunk, chunk });
+        }
+
+        CHECK(reader.read_many(reqs.data(), reqs.size()) == LLAMA_MOE_STATUS_OK);
+
+        for (size_t i = 0; i < n; i++) {
+            const size_t src = ((n - 1) - i) * chunk;
+            for (size_t j = 0; j < chunk; j++) {
+                if (dst[i * chunk + j] != pattern_at(src + j)) {
+                    printf("  FAIL: chunk %zu byte %zu mismatched\n", i, j);
+                    n_fail++;
+                    j = chunk; // report once per chunk
+                    i = n;
+                }
+            }
+        }
+
+        const auto st = reader.stats();
+        CHECK(st.n_read  == n);
+        CHECK(st.n_bytes == chunk * n);
+
+        reader.reset_stats();
+        CHECK(reader.stats().n_read  == 0);
+        CHECK(reader.stats().n_bytes == 0);
+    }
+
+    fclose(f);
+}
+
+static void test_reader_bounds() {
+    printf("test_reader_bounds\n");
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        llama_moe_reader reader;
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, nullptr) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<uint8_t> dst(256, 0);
+
+        // reading right up to the end is fine
+        CHECK(reader.read({ 0, TEST_FILE_SIZE - 256, dst.data(), 256 }) == LLAMA_MOE_STATUS_OK);
+
+        // ...but anything that would run past it is refused before the read is issued
+        CHECK(reader.read({ 0, TEST_FILE_SIZE - 255, dst.data(), 256 }) == LLAMA_MOE_STATUS_IO_ERROR);
+        CHECK(reader.read({ 0, TEST_FILE_SIZE,       dst.data(), 256 }) == LLAMA_MOE_STATUS_IO_ERROR);
+        CHECK(reader.read({ 0, TEST_FILE_SIZE + 1,   dst.data(), 256 }) == LLAMA_MOE_STATUS_IO_ERROR);
+
+        // an offset that overflows when the size is added must not wrap into a valid range
+        CHECK(reader.read({ 0, UINT64_MAX - 16, dst.data(), 256 }) == LLAMA_MOE_STATUS_IO_ERROR);
+
+        // unknown file, null destination
+        CHECK(reader.read({ 3, 0, dst.data(), 256 }) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+        CHECK(reader.read({ 0, 0, nullptr,    256 }) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+
+        // a zero-length read is trivially satisfied
+        CHECK(reader.read({ 0, 0, dst.data(), 0 }) == LLAMA_MOE_STATUS_OK);
+    }
+
+    fclose(f);
+}
+
+static void test_reader_short_read() {
+    printf("test_reader_short_read\n");
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        // claim the file is bigger than it is, so the bounds check passes but the read comes up short -
+        // this is what a truncated or concurrently replaced model file looks like
+        llama_moe_reader reader;
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE * 2, nullptr) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<uint8_t> dst(4096, 0);
+
+        CHECK(reader.read({ 0, TEST_FILE_SIZE - 1024, dst.data(), 4096 }) == LLAMA_MOE_STATUS_SHORT_READ);
+
+        // a short read must not be counted as delivered bytes
+        CHECK(reader.stats().n_read  == 0);
+        CHECK(reader.stats().n_bytes == 0);
+    }
+
+    fclose(f);
+}
+
+static void test_reader_batch_error_propagates() {
+    printf("test_reader_batch_error_propagates\n");
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        llama_moe_reader reader;
+        CHECK(reader.start_workers(4) == LLAMA_MOE_STATUS_OK);
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, nullptr) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<uint8_t>            dst(8 * 1024, 0);
+        std::vector<llama_moe_read_req> reqs;
+
+        for (size_t i = 0; i < 8; i++) {
+            reqs.push_back({ 0, (uint64_t) (i * 1024), dst.data() + i * 1024, 1024 });
+        }
+
+        // one bad request anywhere in the batch fails the whole batch
+        reqs[5].offset = TEST_FILE_SIZE + 4096;
+
+        CHECK(reader.read_many(reqs.data(), reqs.size()) == LLAMA_MOE_STATUS_IO_ERROR);
+
+        // and the workers are still usable afterwards
+        reqs[5].offset = 5 * 1024;
+        CHECK(reader.read_many(reqs.data(), reqs.size()) == LLAMA_MOE_STATUS_OK);
+    }
+
+    fclose(f);
+}
+
+static void test_reader_lifecycle() {
+    printf("test_reader_lifecycle\n");
+
+    // no path, no file
+    {
+        llama_moe_reader reader;
+        CHECK(reader.add_path(nullptr, nullptr) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+        CHECK(reader.add_path("./definitely-not-a-real-model-file.gguf", nullptr) == LLAMA_MOE_STATUS_IO_ERROR);
+        CHECK(reader.n_files() == 0);
+
+        CHECK(reader.add_fd(-1, 1024, nullptr) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+        CHECK(reader.add_fd(0,     0, nullptr) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+    }
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        llama_moe_reader reader;
+        CHECK(reader.start_workers(3) == LLAMA_MOE_STATUS_OK);
+        CHECK(reader.n_threads() == 3);
+
+        // workers may only be started once
+        CHECK(reader.start_workers(2) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, nullptr) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<uint8_t>            dst(1024, 0);
+        std::vector<llama_moe_read_req> reqs = { { 0, 0, dst.data(), 1024 } };
+
+        CHECK(reader.read_many(reqs.data(), reqs.size()) == LLAMA_MOE_STATUS_OK);
+        CHECK(reader.read_many(nullptr, 0) == LLAMA_MOE_STATUS_OK);
+        CHECK(reader.read_many(nullptr, 1) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+
+        // after shutdown, further work is refused rather than silently skipped
+        reader.shutdown();
+        CHECK(reader.read_many(reqs.data(), reqs.size()) == LLAMA_MOE_STATUS_CANCELLED);
+
+        // shutdown is idempotent
+        reader.shutdown();
+    }
+
+    // the reader duplicated the descriptor, so closing ours does not disturb it
+    {
+        llama_moe_reader reader;
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, nullptr) == LLAMA_MOE_STATUS_OK);
+
+        fclose(f);
+        f = nullptr;
+
+        std::vector<uint8_t> dst(1024, 0);
+        CHECK(reader.read({ 0, 0, dst.data(), 1024 }) == LLAMA_MOE_STATUS_OK);
+
+        for (size_t j = 0; j < 1024; j++) {
+            if (dst[j] != pattern_at(j)) {
+                printf("  FAIL: byte %zu mismatched after the original handle was closed\n", j);
+                n_fail++;
+                break;
+            }
+        }
+    }
+
+    if (f != nullptr) {
+        fclose(f);
+    }
+}
+
 int main() {
     test_min_slots();
     test_init_validation();
@@ -345,6 +602,14 @@ int main() {
     test_invalidate();
     test_stats_accounting();
     test_status_strings();
+
+    test_reader_reads(0);
+    test_reader_reads(1);
+    test_reader_reads(4);
+    test_reader_bounds();
+    test_reader_short_read();
+    test_reader_batch_error_propagates();
+    test_reader_lifecycle();
 
     if (n_fail > 0) {
         printf("\n%d check(s) failed\n", n_fail);
