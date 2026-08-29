@@ -2806,6 +2806,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--moe-n-slots"}, "N",
+        "keep only N experts of each paged MoE layer resident, reading the rest from the model file on demand (default: 0, disabled)\n"
+        "trades throughput for memory, so it only helps when the model does not fit but its working set does\n"
+        "N must be at least n_expert_used * n_ubatch",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe.n_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_N_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-n-layers"}, "N",
+        "number of leading MoE layers to page with --moe-n-slots (default: 0, meaning every MoE layer)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe.n_layers = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_N_LAYERS"));
+    add_opt(common_arg(
+        {"--moe-read-threads"}, "N",
+        "threads used to read experts for --moe-n-slots (default: 0, pick a default)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe.n_read_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_READ_THREADS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

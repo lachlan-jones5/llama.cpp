@@ -310,6 +310,17 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // Bounded residency for MoE expert weights.
+    //
+    // Instead of keeping all of a layer's experts resident, keep n_slots of them and read the rest from the
+    // model file as the router selects them. This trades throughput for a much smaller footprint, and only
+    // helps when the model does not fit but its working set does. Disabled unless n_slots is set.
+    struct llama_moe_params {
+        int32_t n_slots;        // resident expert slots per paged layer (0 disables expert paging)
+        int32_t n_layers;       // number of leading MoE layers to page (0 = every MoE layer)
+        int32_t n_read_threads; // threads used to read experts (0 = pick a default)
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -339,6 +350,9 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // bounded residency for MoE expert weights
+        struct llama_moe_params moe;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
