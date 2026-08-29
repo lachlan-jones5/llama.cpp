@@ -151,6 +151,9 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# compiles the residency source directly, so it needs no LLAMA_API exports and runs everywhere
+llama_build_and_test(test-moe-residency.cpp ${PROJECT_SOURCE_DIR}/src/llama-moe-residency.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)

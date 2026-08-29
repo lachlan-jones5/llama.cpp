@@ -1,0 +1,356 @@
+// Unit tests for the backend-independent MoE expert residency state machine.
+//
+// This exercises policy only - no model, no backend, no I/O.
+
+#include "../src/llama-moe-residency.h"
+
+#include <cstdio>
+#include <vector>
+
+static int n_fail = 0;
+
+#define CHECK(cond)                                                                     \
+    do {                                                                                \
+        if (!(cond)) {                                                                   \
+            printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                     \
+            n_fail++;                                                                    \
+        }                                                                                \
+    } while (0)
+
+// resolve a ubatch and hand back the slots it mapped to
+static llama_moe_status run(
+        llama_moe_layer_cache & cache,
+        const std::vector<int32_t> & ids,
+        std::vector<int32_t> & slots,
+        std::vector<llama_moe_fill> & fills) {
+    slots.assign(ids.size(), -1);
+
+    return cache.resolve(ids.data(), (int32_t) ids.size(), slots.data(), fills);
+}
+
+static void test_min_slots() {
+    printf("test_min_slots\n");
+
+    // bounded by the number of distinct experts that can be routed to
+    CHECK(llama_moe_min_slots(128, 8, 1)  == 8);
+    CHECK(llama_moe_min_slots(128, 8, 4)  == 32);
+    // ...but never more than the layer has
+    CHECK(llama_moe_min_slots(128, 8, 64) == 128);
+    CHECK(llama_moe_min_slots(8,   8, 1)  == 8);
+
+    // must not overflow when widening n_expert_used * n_ubatch
+    CHECK(llama_moe_min_slots(64, 1 << 20, 1 << 20) == 64);
+
+    CHECK(llama_moe_min_slots(0, 8, 1) == 0);
+    CHECK(llama_moe_min_slots(8, 0, 1) == 0);
+}
+
+static void test_init_validation() {
+    printf("test_init_validation\n");
+
+    llama_moe_layer_cache cache;
+
+    CHECK(cache.init(0,  0,  4) == LLAMA_MOE_STATUS_INVALID_CONFIG);  // no experts
+    CHECK(cache.init(0,  8,  0) == LLAMA_MOE_STATUS_INVALID_CONFIG);  // no slots
+    CHECK(cache.init(0,  8, -1) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+    CHECK(cache.init(0,  8,  9) == LLAMA_MOE_STATUS_INVALID_CONFIG);  // more slots than experts
+
+    CHECK(cache.init(3,  8,  4) == LLAMA_MOE_STATUS_OK);
+    CHECK(cache.layer()    == 3);
+    CHECK(cache.n_expert() == 8);
+    CHECK(cache.n_slots()  == 4);
+
+    // a fresh cache holds nothing
+    for (int32_t e = 0; e < 8; e++) {
+        CHECK(cache.slot_of(e) == -1);
+    }
+    for (int32_t s = 0; s < 4; s++) {
+        CHECK(cache.expert_in(s) == -1);
+    }
+
+    // out-of-range queries are answered, not crashed
+    CHECK(cache.slot_of(-1)  == -1);
+    CHECK(cache.slot_of(999) == -1);
+    CHECK(cache.expert_in(-1)  == -1);
+    CHECK(cache.expert_in(999) == -1);
+}
+
+static void test_miss_then_hit() {
+    printf("test_miss_then_hit\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 4) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // cold: every id is a miss and must be filled
+    CHECK(run(cache, {0, 1}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.size() == 2);
+    CHECK(cache.stats().n_miss == 2);
+    CHECK(cache.stats().n_hit  == 0);
+    CHECK(cache.stats().n_evict == 0);
+
+    // the reported fills agree with the map
+    for (const auto & f : fills) {
+        CHECK(cache.slot_of(f.expert)  == f.slot);
+        CHECK(cache.expert_in(f.slot)  == f.expert);
+    }
+
+    const int32_t slot0 = cache.slot_of(0);
+    const int32_t slot1 = cache.slot_of(1);
+    CHECK(slot0 != slot1);
+
+    // warm: same experts, no fills, same slots
+    CHECK(run(cache, {0, 1}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.empty());
+    CHECK(cache.stats().n_hit  == 2);
+    CHECK(cache.stats().n_miss == 2);
+    CHECK(slots[0] == slot0);
+    CHECK(slots[1] == slot1);
+}
+
+static void test_repeated_id_fills_once() {
+    printf("test_repeated_id_fills_once\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 4) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // the same expert routed by several tokens in one ubatch occupies one slot and is read once
+    CHECK(run(cache, {5, 5, 5, 5}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.size() == 1);
+    CHECK(cache.stats().n_miss == 1);
+    CHECK(cache.stats().n_hit  == 3);
+    CHECK(slots[0] == slots[1]);
+    CHECK(slots[1] == slots[2]);
+    CHECK(slots[2] == slots[3]);
+}
+
+static void test_lru_eviction_order() {
+    printf("test_lru_eviction_order\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 2) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // fill both slots: 0 is older than 1
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {1}, slots, fills) == LLAMA_MOE_STATUS_OK);
+
+    // touch 0 so that 1 becomes the least recently used
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.empty());
+
+    // admitting 2 must displace 1, not 0
+    CHECK(run(cache, {2}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.size() == 1);
+    CHECK(cache.slot_of(1) == -1);
+    CHECK(cache.slot_of(0) != -1);
+    CHECK(cache.slot_of(2) != -1);
+    CHECK(cache.stats().n_evict == 1);
+}
+
+static void test_in_ubatch_pinning() {
+    printf("test_in_ubatch_pinning\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 2) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // two distinct experts exactly fill the pool, and both stay valid for the whole ubatch
+    CHECK(run(cache, {3, 4}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(slots[0] != slots[1]);
+    CHECK(cache.slot_of(3) != -1);
+    CHECK(cache.slot_of(4) != -1);
+
+    // a third distinct expert in the same ubatch cannot be served: evicting either of the first two
+    // would corrupt a matmul that still needs them
+    CHECK(run(cache, {3, 4, 5}, slots, fills) == LLAMA_MOE_STATUS_SLOTS_EXHAUSTED);
+
+    // the failure must not leave slots claiming to hold data that was never read
+    for (int32_t e = 0; e < 8; e++) {
+        CHECK(cache.slot_of(e) == -1);
+    }
+    CHECK(fills.empty());
+}
+
+static void test_minimum_slot_boundary() {
+    printf("test_minimum_slot_boundary\n");
+
+    const int32_t n_expert      = 64;
+    const int32_t n_expert_used = 8;
+
+    // exactly the minimum pool for a single-token ubatch succeeds
+    {
+        llama_moe_layer_cache cache;
+        const int32_t n_slots = llama_moe_min_slots(n_expert, n_expert_used, 1);
+        CHECK(n_slots == 8);
+        CHECK(cache.init(0, n_expert, n_slots) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<int32_t>        slots;
+        std::vector<llama_moe_fill> fills;
+        CHECK(run(cache, {0, 1, 2, 3, 4, 5, 6, 7}, slots, fills) == LLAMA_MOE_STATUS_OK);
+        CHECK(fills.size() == 8);
+    }
+
+    // one slot short of the minimum fails cleanly instead of corrupting
+    {
+        llama_moe_layer_cache cache;
+        CHECK(cache.init(0, n_expert, n_expert_used - 1) == LLAMA_MOE_STATUS_OK);
+
+        std::vector<int32_t>        slots;
+        std::vector<llama_moe_fill> fills;
+        CHECK(run(cache, {0, 1, 2, 3, 4, 5, 6, 7}, slots, fills) == LLAMA_MOE_STATUS_SLOTS_EXHAUSTED);
+    }
+}
+
+static void test_invalid_expert_id() {
+    printf("test_invalid_expert_id\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 4) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    CHECK(run(cache, {8},  slots, fills) == LLAMA_MOE_STATUS_INVALID_EXPERT);
+    CHECK(run(cache, {-1}, slots, fills) == LLAMA_MOE_STATUS_INVALID_EXPERT);
+
+    // a bad id partway through a ubatch must not leave the earlier admissions looking resident
+    CHECK(run(cache, {0, 1, 99}, slots, fills) == LLAMA_MOE_STATUS_INVALID_EXPERT);
+    for (int32_t e = 0; e < 8; e++) {
+        CHECK(cache.slot_of(e) == -1);
+    }
+    CHECK(fills.empty());
+}
+
+static void test_empty_and_bad_arguments() {
+    printf("test_empty_and_bad_arguments\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 4) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<llama_moe_fill> fills;
+
+    // an empty ubatch is legal and asks for nothing
+    CHECK(cache.resolve(nullptr, 0, nullptr, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.empty());
+
+    int32_t slot = -1;
+    int32_t id   = 0;
+    CHECK(cache.resolve(nullptr, 1, &slot,   fills) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+    CHECK(cache.resolve(&id,     1, nullptr, fills) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+    CHECK(cache.resolve(&id,    -1, &slot,   fills) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+
+    // an uninitialised cache refuses work rather than dividing by zero
+    llama_moe_layer_cache fresh;
+    CHECK(fresh.resolve(&id, 1, &slot, fills) == LLAMA_MOE_STATUS_INVALID_CONFIG);
+}
+
+static void test_invalidate() {
+    printf("test_invalidate\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 4) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    CHECK(run(cache, {0, 1, 2}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(cache.slot_of(1) != -1);
+
+    // after a failed read the slot contents are undefined, so residency must be dropped
+    cache.invalidate();
+
+    for (int32_t e = 0; e < 8; e++) {
+        CHECK(cache.slot_of(e) == -1);
+    }
+    for (int32_t s = 0; s < 4; s++) {
+        CHECK(cache.expert_in(s) == -1);
+    }
+
+    // and the next ubatch re-reads everything
+    CHECK(run(cache, {0, 1, 2}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.size() == 3);
+}
+
+static void test_stats_accounting() {
+    printf("test_stats_accounting\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 4, 2) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    CHECK(run(cache, {0, 1}, slots, fills) == LLAMA_MOE_STATUS_OK);  // 2 miss
+    CHECK(run(cache, {0, 1}, slots, fills) == LLAMA_MOE_STATUS_OK);  // 2 hit
+    CHECK(run(cache, {2, 3}, slots, fills) == LLAMA_MOE_STATUS_OK);  // 2 miss, 2 evict
+
+    const auto & st = cache.stats();
+    CHECK(st.n_resolve == 3);
+    CHECK(st.n_lookup  == 6);
+    CHECK(st.n_hit     == 2);
+    CHECK(st.n_miss    == 4);
+    CHECK(st.n_evict   == 2);
+    CHECK(st.n_hit + st.n_miss == st.n_lookup);
+
+    cache.reset_stats();
+    CHECK(cache.stats().n_lookup == 0);
+    CHECK(cache.stats().n_hit    == 0);
+
+    // resetting statistics must not disturb residency
+    CHECK(run(cache, {2, 3}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.empty());
+}
+
+static void test_status_strings() {
+    printf("test_status_strings\n");
+
+    const llama_moe_status all[] = {
+        LLAMA_MOE_STATUS_OK,
+        LLAMA_MOE_STATUS_INVALID_CONFIG,
+        LLAMA_MOE_STATUS_INVALID_EXPERT,
+        LLAMA_MOE_STATUS_SLOTS_EXHAUSTED,
+        LLAMA_MOE_STATUS_IO_ERROR,
+        LLAMA_MOE_STATUS_SHORT_READ,
+        LLAMA_MOE_STATUS_BACKEND_ERROR,
+        LLAMA_MOE_STATUS_CANCELLED,
+    };
+
+    for (const auto s : all) {
+        const char * str = llama_moe_status_str(s);
+        CHECK(str != nullptr);
+        CHECK(str[0] != '\0');
+    }
+}
+
+int main() {
+    test_min_slots();
+    test_init_validation();
+    test_miss_then_hit();
+    test_repeated_id_fills_once();
+    test_lru_eviction_order();
+    test_in_ubatch_pinning();
+    test_minimum_slot_boundary();
+    test_invalid_expert_id();
+    test_empty_and_bad_arguments();
+    test_invalidate();
+    test_stats_accounting();
+    test_status_strings();
+
+    if (n_fail > 0) {
+        printf("\n%d check(s) failed\n", n_fail);
+        return 1;
+    }
+
+    printf("\nall checks passed\n");
+    return 0;
+}
