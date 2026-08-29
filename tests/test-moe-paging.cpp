@@ -54,11 +54,13 @@ struct run_result {
 };
 
 // Load the model with the given slot count (0 = paging off) and decode tokens, returning the logits.
+static int32_t g_n_gpu_layers = 0;
+
 static run_result run(const std::string & path, int32_t n_slots, uint32_t n_ubatch, bool expect_ok) {
     run_result out;
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;               // keep the comparison on one backend
+    mparams.n_gpu_layers = g_n_gpu_layers;  // both runs use the same placement, so the comparison is fair
     mparams.moe.n_slots  = n_slots;
 
     llama_model * model = llama_model_load_from_file(path.c_str(), mparams);
@@ -144,8 +146,10 @@ int main(int argc, char ** argv) {
             path = argv[++i];
         } else if (strcmp(argv[i], "--slots") == 0 && i + 1 < argc) {
             slots_arg = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-ngl") == 0 || strcmp(argv[i], "--n-gpu-layers") == 0) && i + 1 < argc) {
+            g_n_gpu_layers = atoi(argv[++i]);
         } else {
-            printf("usage: %s -m <model.gguf> [--slots N]\n", argv[0]);
+            printf("usage: %s -m <model.gguf> [--slots N] [-ngl N]\n", argv[0]);
             return 1;
         }
     }
@@ -163,7 +167,7 @@ int main(int argc, char ** argv) {
         }
     }, nullptr);
 
-    printf("model: %s\n", path.c_str());
+    printf("model: %s (n_gpu_layers = %d)\n", path.c_str(), g_n_gpu_layers);
 
     // reference: everything resident
     printf("reference (no paging)\n");

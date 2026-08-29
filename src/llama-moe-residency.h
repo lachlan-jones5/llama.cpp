@@ -235,6 +235,10 @@ struct llama_moe_pool {
 
     size_t slot_stride = 0;  // bytes between slots in the pool buffer; not necessarily the disk stride
     size_t read_size   = 0;  // bytes of a single expert on disk
+
+    // True when the pool buffer can be written through a plain host pointer, so an expert can be read
+    // straight into its slot. False for device memory, where the read goes to staging and is then copied in.
+    bool host_writable = false;
 };
 
 // All pools of one layer share a residency map, so they evict in lockstep and a single remapped id array
@@ -321,8 +325,27 @@ private:
 
     llama_moe_reader reader;
 
-    std::vector<llama_moe_fill>     fills;  // scratch, reused across resolves
-    std::vector<llama_moe_read_req> reqs;   // scratch, reused across resolves
+    // Make sure the staging area can hold n_bytes, preferring pinned host memory when the device offers it
+    // so the host-to-device copies are not bounced through pageable memory.
+    llama_moe_status ensure_staging(size_t n_bytes, ggml_backend_buffer_type_t buft);
+
+    // an expert read into staging that still has to be copied into its slot
+    struct staged_copy {
+        const llama_moe_pool * pool;
+        size_t                 staging_off;
+        size_t                 slot_off;
+    };
+
+    std::vector<llama_moe_fill>     fills;   // scratch, reused across resolves
+    std::vector<llama_moe_read_req> reqs;    // scratch, reused across resolves
+    std::vector<staged_copy>        staged;  // scratch, reused across resolves
+
+    // Reusable staging for pools that cannot be written directly. Allocated once and grown as needed, never
+    // per token. Pinned when the backend provides a host buffer type, otherwise ordinary memory.
+    ggml_backend_buffer_ptr staging_buf;
+    std::vector<uint8_t>    staging_vec;
+    uint8_t *               staging     = nullptr;
+    size_t                  staging_cap = 0;
 
     std::atomic<int> first_err{(int) LLAMA_MOE_STATUS_OK};
     std::string      err_detail;

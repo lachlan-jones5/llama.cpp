@@ -666,6 +666,10 @@ ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * ori
     pool.slot_stride = pool.tensor->nb[2];  // distance between slots in the pool
     pool.read_size   = pool.info.stride;    // bytes one expert occupies on disk
 
+    // CPU buffers can be read into directly; device memory has to go through staging. Metal reports false
+    // here even for unified memory, so it takes the staging path too - correct, just not yet optimal.
+    pool.host_writable = ggml_backend_buffer_is_host(pool.buf.get());
+
     // The two are separate quantities and treating them as one would silently read the wrong bytes, so
     // require them to agree rather than assuming it.
     if (pool.slot_stride != pool.read_size) {
@@ -704,7 +708,36 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
 
     // every pool of the layer evicts in lockstep, so one admission means one read per pool
     reqs.clear();
+    staged.clear();
     reqs.reserve(fills.size() * layer.pools.size());
+
+    // size the staging area for the pools that cannot be written directly
+    size_t staging_need = 0;
+    for (const auto & pool : layer.pools) {
+        if (!pool.host_writable) {
+            staging_need += fills.size() * pool.read_size;
+        }
+    }
+
+    if (staging_need > 0) {
+        ggml_backend_buffer_type_t buft = nullptr;
+        for (const auto & pool : layer.pools) {
+            if (!pool.host_writable && pool.buf) {
+                buft = ggml_backend_buffer_get_type(pool.buf.get());
+                break;
+            }
+        }
+
+        const llama_moe_status st = ensure_staging(staging_need, buft);
+        if (st != LLAMA_MOE_STATUS_OK) {
+            layer.cache.invalidate();
+            std::fill(out_slots, out_slots + n, 0);
+            latch(st, "failed to allocate expert staging memory");
+            return st;
+        }
+    }
+
+    size_t staging_off = 0;
 
     for (const auto & pool : layer.pools) {
         uint8_t * base = (uint8_t *) pool.tensor->data;
@@ -715,10 +748,22 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
         }
 
         for (const auto & fill : fills) {
+            const size_t slot_off = (size_t) fill.slot * pool.slot_stride;
+
+            void * dst;
+
+            if (pool.host_writable) {
+                dst = base + slot_off;
+            } else {
+                dst = staging + staging_off;
+                staged.push_back({ &pool, staging_off, slot_off });
+                staging_off += pool.read_size;
+            }
+
             reqs.push_back({
                 /*.file_idx =*/ pool.info.file_idx,
                 /*.offset   =*/ pool.info.offset + (uint64_t) fill.expert * pool.info.stride,
-                /*.dst      =*/ base + (size_t) fill.slot * pool.slot_stride,
+                /*.dst      =*/ dst,
                 /*.size     =*/ pool.read_size,
             });
         }
@@ -733,6 +778,48 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
         latch(io, "layer " + std::to_string(il) + ": " + llama_moe_status_str(io));
         return io;
     }
+
+    // hand the staged experts to the backend now that they are all read
+    for (const auto & copy : staged) {
+        ggml_backend_tensor_set(copy.pool->tensor, staging + copy.staging_off, copy.slot_off, copy.pool->read_size);
+    }
+
+    return LLAMA_MOE_STATUS_OK;
+}
+
+llama_moe_status llama_moe_residency::ensure_staging(size_t n_bytes, ggml_backend_buffer_type_t buft) {
+    if (n_bytes <= staging_cap && staging != nullptr) {
+        return LLAMA_MOE_STATUS_OK;
+    }
+
+    // grow generously so a steady state is reached quickly and no allocation happens per token
+    const size_t want = n_bytes + n_bytes/2;
+
+    // Pinned host memory where the device offers it, so the host-to-device copies are not bounced through
+    // pageable memory. Not every backend has one, hence the plain fallback.
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+
+    ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+
+    if (host_buft != nullptr) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, want);
+
+        if (buf != nullptr) {
+            staging_buf.reset(buf);
+            staging_vec.clear();
+            staging_vec.shrink_to_fit();
+            staging     = (uint8_t *) ggml_backend_buffer_get_base(buf);
+            staging_cap = want;
+
+            return LLAMA_MOE_STATUS_OK;
+        }
+        // fall through to ordinary memory if pinning failed
+    }
+
+    staging_buf.reset();
+    staging_vec.resize(want);
+    staging     = staging_vec.data();
+    staging_cap = want;
 
     return LLAMA_MOE_STATUS_OK;
 }
