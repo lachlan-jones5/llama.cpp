@@ -214,6 +214,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # paged MoE experts must match fully resident ones on a real (generated) MoE model
+    llama_build_and_test(test-moe-paging.cpp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen3moe-moe.gguf"
+    )
+    set_tests_properties(test-moe-paging PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main

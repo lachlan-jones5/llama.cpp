@@ -4354,3 +4354,58 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+//
+// MoE expert paging stats
+//
+
+llama_moe_stats_data llama_moe_stats(const llama_context * ctx) {
+    llama_moe_stats_data data = {};
+
+    if (ctx == nullptr || !ctx->get_moe_res()) {
+        return data;
+    }
+
+    const auto layer = ctx->get_moe_res()->total_stats();
+    const auto io    = ctx->get_moe_res()->io_stats();
+
+    data.n_lookup     = (int64_t) layer.n_lookup;
+    data.n_hit        = (int64_t) layer.n_hit;
+    data.n_miss       = (int64_t) layer.n_miss;
+    data.n_evict      = (int64_t) layer.n_evict;
+    data.n_read       = (int64_t) io.n_read;
+    data.n_bytes_read = (int64_t) io.n_bytes;
+    data.t_read_ms    = 1e-3 * (double) io.t_read_us;
+
+    return data;
+}
+
+void llama_moe_stats_print(const llama_context * ctx) {
+    const auto data = llama_moe_stats(ctx);
+
+    if (data.n_lookup == 0) {
+        return; // paging is off, or nothing was routed through it
+    }
+
+    const double hit_rate = 100.0 * (double) data.n_hit / (double) data.n_lookup;
+    const double mib      = (double) data.n_bytes_read / (1024.0*1024.0);
+
+    LLAMA_LOG_INFO("%s:  expert lookups = %10" PRId64 "\n", __func__, data.n_lookup);
+    LLAMA_LOG_INFO("%s:      cache hits = %10" PRId64 " (%6.2f %%)\n", __func__, data.n_hit, hit_rate);
+    LLAMA_LOG_INFO("%s:    cache misses = %10" PRId64 "\n", __func__, data.n_miss);
+    LLAMA_LOG_INFO("%s:      evictions  = %10" PRId64 "\n", __func__, data.n_evict);
+    LLAMA_LOG_INFO("%s:      expert reads = %8" PRId64 " (%8.2f MiB)\n", __func__, data.n_read, mib);
+
+    if (data.t_read_ms > 0.0) {
+        LLAMA_LOG_INFO("%s:       read time = %10.2f ms (%8.2f MiB/s)\n",
+                __func__, data.t_read_ms, mib / (data.t_read_ms / 1000.0));
+    }
+}
+
+void llama_moe_stats_reset(llama_context * ctx) {
+    if (ctx == nullptr || !ctx->get_moe_res()) {
+        return;
+    }
+
+    ctx->get_moe_res()->reset_stats();
+}

@@ -2090,6 +2090,7 @@ int llama_perplexity(int argc, char ** argv) {
 
     LOG("\n");
     llama_perf_context_print(ctx);
+    llama_moe_stats_print(ctx);
     common_memory_breakdown_print(ctx);
 
     llama_backend_free();

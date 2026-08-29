@@ -1607,6 +1607,21 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 
+    // MoE expert paging counters, summed over every paged layer. All zero unless --moe-n-slots is in use.
+    struct llama_moe_stats_data {
+        int64_t n_lookup;     // routed expert ids examined
+        int64_t n_hit;        // ids that were already resident
+        int64_t n_miss;       // ids that had to be read in
+        int64_t n_evict;      // resident experts displaced to make room
+        int64_t n_read;       // completed reads
+        int64_t n_bytes_read; // bytes read from the model file
+        double  t_read_ms;    // wall time spent reading experts
+    };
+
+    LLAMA_API struct llama_moe_stats_data llama_moe_stats      (const struct llama_context * ctx);
+    LLAMA_API void                        llama_moe_stats_print(const struct llama_context * ctx);
+    LLAMA_API void                        llama_moe_stats_reset(      struct llama_context * ctx);
+
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);

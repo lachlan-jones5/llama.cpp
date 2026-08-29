@@ -250,6 +250,7 @@ int llama_batched_bench(int argc, char ** argv) {
 
     LOG("\n");
     llama_perf_context_print(ctx);
+    llama_moe_stats_print(ctx);
 
     llama_batch_free(batch);
 

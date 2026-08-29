@@ -188,6 +188,9 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    // null unless MoE expert paging is active
+    llama_moe_residency * get_moe_res() const { return moe_res.get(); }
+
     llama_memory_breakdown memory_breakdown() const;
 
     //

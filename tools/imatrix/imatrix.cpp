@@ -1186,6 +1186,7 @@ int main(int argc, char ** argv) {
 
     LOG("\n");
     llama_perf_context_print(ctx);
+    llama_moe_stats_print(ctx);
 
     llama_backend_free();
 

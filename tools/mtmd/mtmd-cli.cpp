@@ -555,5 +555,6 @@ int main(int argc, char ** argv) {
     if (g_is_interrupted) LOG("\nInterrupted by user\n");
     LOG("\n\n");
     llama_perf_context_print(ctx.lctx);
+    llama_moe_stats_print(ctx.lctx);
     return g_is_interrupted ? 130 : 0;
 }

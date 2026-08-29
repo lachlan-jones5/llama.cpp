@@ -2522,6 +2522,8 @@ int llama_bench(int argc, char ** argv) {
 
         llama_perf_context_print(ctx);
 
+        llama_moe_stats_print(ctx);
+
         llama_free(ctx);
 
         ggml_threadpool_free_fn(threadpool);
