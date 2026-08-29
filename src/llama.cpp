@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -311,6 +312,87 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// Reject expert-paging configurations that cannot work, before any weights are read.
+//
+// Everything here is decidable from the model alone. The bound that also depends on the ubatch is checked
+// when the context is created, since that is the first point n_ubatch is known.
+static void llama_moe_validate_params(const llama_model_params & params, const llama_model_base & model) {
+    const llama_moe_params & moe = params.moe;
+
+    if (moe.n_slots == 0) {
+        if (moe.n_layers != 0 || moe.n_read_threads != 0) {
+            LLAMA_LOG_WARN("%s: --moe-n-layers/--moe-read-threads have no effect without --moe-n-slots\n", __func__);
+        }
+        return;
+    }
+
+    const auto & hparams = model.hparams;
+
+    const uint32_t n_expert      = hparams.n_expert;
+    const uint32_t n_expert_used = hparams.n_expert_used;
+
+    if (n_expert == 0 || n_expert_used == 0) {
+        throw std::runtime_error(format(
+            "--moe-n-slots was given but this model has no routed experts"));
+    }
+
+    // paging a layer whose every expert is used each token would read the whole layer per token
+    if (n_expert_used >= n_expert) {
+        throw std::runtime_error(format(
+            "--moe-n-slots cannot be used with this model: every one of its %u experts is used per token",
+            n_expert));
+    }
+
+    if ((uint32_t) moe.n_slots > n_expert) {
+        throw std::runtime_error(format(
+            "--moe-n-slots (%d) exceeds the %u experts per layer of this model",
+            moe.n_slots, n_expert));
+    }
+
+    // a single token already routes to n_expert_used distinct experts, all of which must be resident at once
+    if ((uint32_t) moe.n_slots < n_expert_used) {
+        throw std::runtime_error(format(
+            "--moe-n-slots (%d) is below the %u experts this model uses per token",
+            moe.n_slots, n_expert_used));
+    }
+
+    if (moe.n_layers > 0 && (uint32_t) moe.n_layers > hparams.n_layer_all) {
+        throw std::runtime_error(format(
+            "--moe-n-layers (%d) exceeds the %u layers of this model",
+            moe.n_layers, hparams.n_layer_all));
+    }
+
+    // expert paging owns the placement of expert tensors, so a buffer-type override that also claims them
+    // (--cpu-moe, --n-cpu-moe, or a matching --override-tensor) would fight it
+    if (params.tensor_buft_overrides != nullptr) {
+        static const char * const probes[] = {
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_up_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+            "blk.0.ffn_gate_up_exps.weight",
+        };
+
+        for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+            for (const char * probe : probes) {
+                try {
+                    if (std::regex_search(std::string(probe), std::regex(o->pattern))) {
+                        throw std::runtime_error(format(
+                            "--moe-n-slots conflicts with a tensor buffer type override matching '%s' "
+                            "(--cpu-moe/--n-cpu-moe/--override-tensor); use one or the other",
+                            o->pattern));
+                    }
+                } catch (const std::regex_error &) {
+                    // a malformed pattern is diagnosed by the loader itself
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: MoE expert paging enabled: %d of %u experts resident per layer, %s layers\n",
+            __func__, moe.n_slots, n_expert,
+            moe.n_layers > 0 ? format("first %d", moe.n_layers).c_str() : "all MoE");
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
@@ -364,6 +446,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
         }
+
+        llama_moe_validate_params(params, *model);
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};

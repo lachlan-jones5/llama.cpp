@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-residency.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -245,6 +246,23 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    // Expert paging needs every expert a ubatch routes to resident at the same time, so the pool has to be
+    // at least as large as the worst case for this ubatch. n_ubatch is only settled here, which is why this
+    // half of the check does not live with the rest in llama_model_load().
+    if (model.moe_params().n_slots > 0) {
+        const uint32_t n_needed = (uint32_t) llama_moe_min_slots(
+                (int32_t) model.hparams.n_expert,
+                (int32_t) model.hparams.n_expert_used,
+                (int32_t) cparams.n_ubatch);
+
+        if ((uint32_t) model.moe_params().n_slots < n_needed) {
+            throw std::runtime_error(format(
+                "--moe-n-slots (%d) is too small for n_ubatch %u: this model uses %u experts per token, "
+                "so %u slots are needed (raise --moe-n-slots or lower --ubatch-size)",
+                model.moe_params().n_slots, cparams.n_ubatch, model.hparams.n_expert_used, n_needed));
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
