@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+struct llama_moe_residency;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -803,6 +804,9 @@ struct llm_graph_params {
         return true;
     }
 
+    // bounded residency of MoE expert weights; null unless --moe-n-slots is in use
+    llama_moe_residency * moe_res;
+
     uint32_t n_outputs;
 
     llm_graph_cb cb;
@@ -879,7 +883,9 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            // a reused graph keeps its slot pool tensors, so it is only valid for the same residency map
+            moe_res == other.moe_res;
     }
 };
 
@@ -1028,6 +1034,9 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    // bounded residency of MoE expert weights; null unless --moe-n-slots is in use
+    llama_moe_residency * moe_res;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1059,7 +1068,9 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              // ids for tensors that are still sized by n_expert, when ids indexes a bounded slot pool
+              ggml_tensor * ids_full = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

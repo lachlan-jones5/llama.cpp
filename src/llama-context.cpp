@@ -374,6 +374,30 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // Set up expert paging once the backends exist. The pools themselves are allocated lazily during
+        // graph building, when the buffer type each layer's resident weights landed on is known.
+        if (model.moe_params().n_slots > 0 && !model.moe_paged.empty()) {
+            moe_res = std::make_unique<llama_moe_residency>();
+
+            llama_moe_status status = moe_res->init(model.moe_params(), model.moe_paged);
+
+            for (size_t i = 0; i < model.moe_files.size() && status == LLAMA_MOE_STATUS_OK; i++) {
+                size_t idx = 0;
+                status = moe_res->add_file(model.moe_files[i].fd, model.moe_files[i].size, &idx);
+
+                // llama_moe_tensor_info::file_idx indexes the model's file list, so the reader has to
+                // agree on the ordering
+                if (status == LLAMA_MOE_STATUS_OK && idx != i) {
+                    status = LLAMA_MOE_STATUS_INVALID_CONFIG;
+                }
+            }
+
+            if (status != LLAMA_MOE_STATUS_OK) {
+                throw std::runtime_error(format("failed to set up MoE expert paging: %s",
+                            llama_moe_status_str(status)));
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -499,6 +523,12 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // Stop the reader only after the device is idle. Doing it the other way round can leave a device
+    // waiting on experts that will now never arrive.
+    if (moe_res) {
+        moe_res->shutdown();
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1406,6 +1436,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // A slot pool that could not be bound leaves the graph pointing at an expert tensor with no storage.
+    // Checked here rather than next to the graph build so that a reused graph is covered too.
+    if (moe_res && moe_res->error() != LLAMA_MOE_STATUS_OK) {
+        LLAMA_LOG_ERROR("%s: MoE expert paging failed: %s (%s)\n", __func__,
+                llama_moe_status_str(moe_res->error()), moe_res->error_detail().c_str());
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2497,6 +2536,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.moe_res     =*/ moe_res.get(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

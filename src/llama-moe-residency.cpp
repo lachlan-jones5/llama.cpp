@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <string>
 
 #if defined(_WIN32)
 #   ifndef WIN32_LEAN_AND_MEAN
@@ -230,7 +231,7 @@ static int64_t llama_moe_pread(int fd, void * dst, size_t size, uint64_t offset)
     return (int64_t) got;
 }
 
-static int llama_moe_dup(int fd) {
+int llama_moe_dup_fd(int fd) {
 #if defined(_WIN32)
     return _dup(fd);
 #else
@@ -238,7 +239,7 @@ static int llama_moe_dup(int fd) {
 #endif
 }
 
-static void llama_moe_close(int fd) {
+void llama_moe_close_fd(int fd) {
 #if defined(_WIN32)
     _close(fd);
 #else
@@ -251,7 +252,7 @@ llama_moe_reader::~llama_moe_reader() {
 
     for (auto & f : files) {
         if (f.fd >= 0) {
-            llama_moe_close(f.fd);
+            llama_moe_close_fd(f.fd);
             f.fd = -1;
         }
     }
@@ -263,7 +264,7 @@ llama_moe_status llama_moe_reader::add_fd(int fd, uint64_t size, size_t * idx) {
     }
 
     // keep our own descriptor so the reader survives the loader closing its handle
-    const int dup_fd = llama_moe_dup(fd);
+    const int dup_fd = llama_moe_dup_fd(fd);
     if (dup_fd < 0) {
         return LLAMA_MOE_STATUS_IO_ERROR;
     }
@@ -527,4 +528,255 @@ void llama_moe_reader::reset_stats() {
     st_n_read   .store(0, std::memory_order_relaxed);
     st_n_bytes  .store(0, std::memory_order_relaxed);
     st_t_read_us.store(0, std::memory_order_relaxed);
+}
+
+//
+// llama_moe_residency
+//
+
+void llama_moe_residency::latch(llama_moe_status status, std::string detail) {
+    if (status == LLAMA_MOE_STATUS_OK) {
+        return;
+    }
+
+    int expected = (int) LLAMA_MOE_STATUS_OK;
+
+    // keep the first failure; later ones are usually consequences of it
+    if (first_err.compare_exchange_strong(expected, (int) status, std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(err_mtx);
+        err_detail = std::move(detail);
+    }
+}
+
+llama_moe_status llama_moe_residency::init(
+        const llama_moe_params & params,
+        const std::unordered_map<std::string, llama_moe_tensor_info> & paged) {
+    if (params.n_slots <= 0 || paged.empty()) {
+        return LLAMA_MOE_STATUS_OK; // paging is off, or the model had nothing to page
+    }
+
+    n_slots    = params.n_slots;
+    paged_info = paged;
+
+    int32_t n_layer_max = 0;
+    for (const auto & [_, info] : paged) {
+        n_layer_max = std::max(n_layer_max, info.il + 1);
+    }
+
+    layers.resize((size_t) n_layer_max);
+
+    // sized once so the pointers handed to graph nodes stay valid for the life of the manager
+    resolve_ctxs.resize((size_t) n_layer_max);
+    for (int32_t il = 0; il < n_layer_max; il++) {
+        resolve_ctxs[(size_t) il] = { this, il };
+    }
+
+    // one residency map per layer, sized by that layer's expert count
+    for (const auto & [name, info] : paged) {
+        auto & layer = layers[(size_t) info.il];
+
+        if (layer.cache.n_slots() == 0) {
+            const int32_t n_slot = std::min(n_slots, info.n_expert);
+
+            const llama_moe_status status = layer.cache.init(info.il, info.n_expert, n_slot);
+            if (status != LLAMA_MOE_STATUS_OK) {
+                return status;
+            }
+        }
+
+        if (layer.cache.n_expert() != info.n_expert) {
+            // every pool of a layer is indexed by the same slot, so they must agree on the expert count
+            return LLAMA_MOE_STATUS_INVALID_CONFIG;
+        }
+    }
+
+    const int32_t n_threads = params.n_read_threads > 0 ? params.n_read_threads : 4;
+
+    return reader.start_workers(n_threads);
+}
+
+llama_moe_status llama_moe_residency::add_file(int fd, uint64_t size, size_t * idx) {
+    return reader.add_fd(fd, size, idx);
+}
+
+bool llama_moe_residency::is_paged_layer(int32_t il) const {
+    return il >= 0 && (size_t) il < layers.size() && layers[(size_t) il].cache.n_slots() > 0;
+}
+
+ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft) {
+    if (!is_paged_layer(il) || orig == nullptr || buft == nullptr) {
+        return nullptr;
+    }
+
+    auto & layer = layers[(size_t) il];
+
+    const std::string name = ggml_get_name(orig);
+
+    // graphs are rebuilt constantly; a pool is created once and reused
+    const auto it = layer.by_name.find(name);
+    if (it != layer.by_name.end()) {
+        return layer.pools[it->second].tensor;
+    }
+
+    llama_moe_pool pool;
+
+    {
+        ggml_init_params ctx_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        pool.ctx.reset(ggml_init(ctx_params));
+        if (!pool.ctx) {
+            latch(LLAMA_MOE_STATUS_BACKEND_ERROR, "failed to create a context for pool " + name);
+            return nullptr;
+        }
+    }
+
+    const int32_t n_slot = layer.cache.n_slots();
+
+    pool.tensor = ggml_new_tensor_3d(pool.ctx.get(), orig->type, orig->ne[0], orig->ne[1], n_slot);
+    if (pool.tensor == nullptr) {
+        latch(LLAMA_MOE_STATUS_BACKEND_ERROR, "failed to create pool tensor for " + name);
+        return nullptr;
+    }
+
+    ggml_set_name(pool.tensor, (name + "#pool").c_str());
+
+    pool.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool.ctx.get(), buft));
+    if (!pool.buf) {
+        latch(LLAMA_MOE_STATUS_BACKEND_ERROR, "failed to allocate a slot pool for " + name);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_set_usage(pool.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Zero the pool so an expert's unused tail never contains stale bytes. CUDA MMQ in particular reads a
+    // little past the end of the last expert and would otherwise see NaNs there.
+    ggml_backend_buffer_clear(pool.buf.get(), 0);
+
+    const auto it_info = paged_info.find(name);
+    if (it_info == paged_info.end()) {
+        latch(LLAMA_MOE_STATUS_INVALID_CONFIG, "no disk location recorded for paged tensor " + name);
+        return nullptr;
+    }
+
+    pool.info        = it_info->second;
+    pool.slot_stride = pool.tensor->nb[2];  // distance between slots in the pool
+    pool.read_size   = pool.info.stride;    // bytes one expert occupies on disk
+
+    // The two are separate quantities and treating them as one would silently read the wrong bytes, so
+    // require them to agree rather than assuming it.
+    if (pool.slot_stride != pool.read_size) {
+        latch(LLAMA_MOE_STATUS_INVALID_CONFIG,
+                "pool stride does not match the on-disk expert stride for " + name);
+        return nullptr;
+    }
+
+    ggml_tensor * ret = pool.tensor;
+
+    layer.by_name[name] = layer.pools.size();
+    layer.pools.push_back(std::move(pool));
+
+    return ret;
+}
+
+llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, int32_t n, int32_t * out_slots) {
+    if (!is_paged_layer(il)) {
+        return LLAMA_MOE_STATUS_INVALID_CONFIG;
+    }
+
+    auto & layer = layers[(size_t) il];
+
+    // decide which experts go where; no I/O yet
+    const llama_moe_status status = layer.cache.resolve(ids, n, out_slots, fills);
+    if (status != LLAMA_MOE_STATUS_OK) {
+        // slot 0 always exists, so the matmul reads in-bounds nonsense instead of running off the pool
+        std::fill(out_slots, out_slots + n, 0);
+        latch(status, "layer " + std::to_string(il) + ": " + llama_moe_status_str(status));
+        return status;
+    }
+
+    if (fills.empty()) {
+        return LLAMA_MOE_STATUS_OK; // everything the ubatch needs is already resident
+    }
+
+    // every pool of the layer evicts in lockstep, so one admission means one read per pool
+    reqs.clear();
+    reqs.reserve(fills.size() * layer.pools.size());
+
+    for (const auto & pool : layer.pools) {
+        uint8_t * base = (uint8_t *) pool.tensor->data;
+
+        if (base == nullptr) {
+            latch(LLAMA_MOE_STATUS_BACKEND_ERROR, "slot pool has no storage");
+            return LLAMA_MOE_STATUS_BACKEND_ERROR;
+        }
+
+        for (const auto & fill : fills) {
+            reqs.push_back({
+                /*.file_idx =*/ pool.info.file_idx,
+                /*.offset   =*/ pool.info.offset + (uint64_t) fill.expert * pool.info.stride,
+                /*.dst      =*/ base + (size_t) fill.slot * pool.slot_stride,
+                /*.size     =*/ pool.read_size,
+            });
+        }
+    }
+
+    const llama_moe_status io = reader.read_many(reqs.data(), reqs.size());
+
+    if (io != LLAMA_MOE_STATUS_OK) {
+        // the slots that were being filled hold undefined bytes now, so drop residency for the layer
+        layer.cache.invalidate();
+        std::fill(out_slots, out_slots + n, 0);
+        latch(io, "layer " + std::to_string(il) + ": " + llama_moe_status_str(io));
+        return io;
+    }
+
+    return LLAMA_MOE_STATUS_OK;
+}
+
+llama_moe_resolve_ctx * llama_moe_residency::resolve_ctx(int32_t il) {
+    if (il < 0 || (size_t) il >= resolve_ctxs.size()) {
+        return nullptr;
+    }
+
+    return &resolve_ctxs[(size_t) il];
+}
+
+void llama_moe_residency::shutdown() {
+    reader.shutdown();
+}
+
+llama_moe_layer_stats llama_moe_residency::layer_stats(int32_t il) const {
+    if (!is_paged_layer(il)) {
+        return {};
+    }
+
+    return layers[(size_t) il].cache.stats();
+}
+
+llama_moe_layer_stats llama_moe_residency::total_stats() const {
+    llama_moe_layer_stats out;
+
+    for (const auto & layer : layers) {
+        const auto & st = layer.cache.stats();
+
+        out.n_resolve += st.n_resolve;
+        out.n_lookup  += st.n_lookup;
+        out.n_hit     += st.n_hit;
+        out.n_miss    += st.n_miss;
+        out.n_evict   += st.n_evict;
+    }
+
+    return out;
+}
+
+void llama_moe_residency::reset_stats() {
+    for (auto & layer : layers) {
+        layer.cache.reset_stats();
+    }
+
+    reader.reset_stats();
 }

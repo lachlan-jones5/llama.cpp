@@ -1186,6 +1186,12 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+
+    for (const auto & file : moe_files) {
+        if (file.fd >= 0) {
+            llama_moe_close_fd(file.fd);
+        }
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1686,6 +1692,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         moe_paged = std::move(ml.moe_paged);
+
+        // The loader closes its handles when it goes out of scope, but the experts must stay readable for
+        // as long as the model lives, so keep our own descriptors. Order matches llama_tensor_weight::idx.
+        moe_files.reserve(ml.files.size());
+        for (const auto & file : ml.files) {
+            const int fd = llama_moe_dup_fd(file->file_id());
+            if (fd < 0) {
+                throw std::runtime_error("failed to duplicate the model file descriptor for expert paging");
+            }
+
+            moe_files.push_back({ fd, (uint64_t) file->size() });
+        }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ml.ctx_moe), std::vector<ggml_backend_buffer_ptr>());
     }

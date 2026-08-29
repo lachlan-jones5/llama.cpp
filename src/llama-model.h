@@ -705,6 +705,12 @@ struct llama_model {
     // disk location of the expert weights that were paged rather than loaded, keyed by tensor name
     std::unordered_map<std::string, llama_moe_tensor_info> moe_paged;
 
+    // Descriptors for the model files, duplicated during loading and held for the life of the model so the
+    // experts stay readable after the loader has closed its own handles. Indices match llama_moe_tensor_info
+    // file_idx. Closed by the destructor.
+    struct moe_file { int fd = -1; uint64_t size = 0; };
+    std::vector<moe_file> moe_files;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

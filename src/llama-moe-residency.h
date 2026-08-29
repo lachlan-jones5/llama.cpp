@@ -1,12 +1,21 @@
 #pragma once
 
+#include "llama.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
 
 // Bounded per-layer residency of MoE expert weights.
 //
@@ -121,6 +130,11 @@ struct llama_moe_io_stats {
     uint64_t t_read_us = 0;  // wall time spent inside read_many(), including waiting on workers
 };
 
+// Duplicate/close a file descriptor portably. The model uses these to hold the GGUF open for the life of
+// the model, since the loader closes its own handles as soon as loading finishes.
+int  llama_moe_dup_fd(int fd);
+void llama_moe_close_fd(int fd);
+
 // one expert's worth of bytes to move from the model file into a destination the caller owns
 struct llama_moe_read_req {
     size_t   file_idx;
@@ -204,4 +218,113 @@ private:
     mutable std::atomic<uint64_t> st_n_read {0};
     mutable std::atomic<uint64_t> st_n_bytes{0};
     std::atomic<uint64_t>         st_t_read_us{0};
+};
+
+//
+// residency manager
+//
+
+// One expert weight tensor of a paged layer, and the bounded pool that stands in for it in the graph.
+struct llama_moe_pool {
+    llama_moe_tensor_info info{};
+
+    ggml_tensor * tensor = nullptr;  // [ne0, ne1, n_slots], what the graph actually reads
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+
+    size_t slot_stride = 0;  // bytes between slots in the pool buffer; not necessarily the disk stride
+    size_t read_size   = 0;  // bytes of a single expert on disk
+};
+
+// All pools of one layer share a residency map, so they evict in lockstep and a single remapped id array
+// is valid for every one of them.
+struct llama_moe_layer {
+    llama_moe_layer_cache cache;
+
+    std::vector<llama_moe_pool> pools;
+
+    // original tensor name -> index into pools, so repeated graph builds reuse the same pool
+    std::unordered_map<std::string, size_t> by_name;
+};
+
+struct llama_moe_residency;
+
+// What the graph's resolve node needs to know: which manager, and which layer it belongs to.
+struct llama_moe_resolve_ctx {
+    llama_moe_residency * res = nullptr;
+    int32_t               il  = -1;
+};
+
+// Owns the residency of every paged layer: the pools, the policy, the reader, and the error state.
+//
+// Backend-independent by construction - it only ever talks to ggml-backend, never to a specific backend's
+// headers. Where a backend can do better than the generic path (writing straight into unified memory,
+// staging through pinned host memory) that is the job of a backend adapter, looked up at runtime.
+struct llama_moe_residency {
+    llama_moe_status init(const llama_moe_params & params,
+                          const std::unordered_map<std::string, llama_moe_tensor_info> & paged);
+
+    // register the model file(s) the experts are read from
+    llama_moe_status add_file(int fd, uint64_t size, size_t * idx);
+
+    bool enabled() const { return n_slots > 0 && !layers.empty(); }
+
+    // Called while the graph is built: hands back the pool tensor that replaces orig, allocating it on
+    // first use in the same buffer type as the layer's resident weights. Returns null if orig is not a
+    // paged tensor or the pool could not be allocated; the error is latched either way.
+    ggml_tensor * bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft);
+
+    // true if this layer has anything paged
+    bool is_paged_layer(int32_t il) const;
+
+    // Bring the experts that ids refers to into slots and write the slot indices to out_slots.
+    // ids and out_slots both hold n entries. Runs the policy, then the reads.
+    //
+    // On failure every entry of out_slots is set to 0. Slot 0 always exists, so the matmul that follows
+    // reads in-bounds nonsense rather than running off the end of the pool; the error is latched and the
+    // decode is failed once the graph finishes.
+    llama_moe_status resolve(int32_t il, const int32_t * ids, int32_t n, int32_t * out_slots);
+
+    // Stable per-layer handle for the graph node that performs the resolve. Valid until shutdown.
+    llama_moe_resolve_ctx * resolve_ctx(int32_t il);
+
+    // stop the reader and release outstanding work; safe to call more than once
+    void shutdown();
+
+    // first error since the last clear, or OK
+    llama_moe_status error() const { return (llama_moe_status) first_err.load(std::memory_order_relaxed); }
+    void clear_error() { first_err.store((int) LLAMA_MOE_STATUS_OK, std::memory_order_relaxed); }
+    const std::string & error_detail() const { return err_detail; }
+
+    llama_moe_io_stats io_stats() const { return reader.stats(); }
+    llama_moe_layer_stats layer_stats(int32_t il) const;
+    // summed over every paged layer
+    llama_moe_layer_stats total_stats() const;
+    void reset_stats();
+
+    int32_t slots() const { return n_slots; }
+
+private:
+    void latch(llama_moe_status status, std::string detail);
+
+    int32_t n_slots = 0;
+
+    // indexed by layer; layers that are not paged are left empty
+    std::vector<llama_moe_layer> layers;
+
+    // disk location of every paged tensor, needed when a pool is bound during graph build
+    std::unordered_map<std::string, llama_moe_tensor_info> paged_info;
+
+    // one per layer, sized once during init so the addresses handed to graph nodes stay valid
+    std::vector<llama_moe_resolve_ctx> resolve_ctxs;
+
+    llama_moe_reader reader;
+
+    std::vector<llama_moe_fill>     fills;  // scratch, reused across resolves
+    std::vector<llama_moe_read_req> reqs;   // scratch, reused across resolves
+
+    std::atomic<int> first_err{(int) LLAMA_MOE_STATUS_OK};
+    std::string      err_detail;
+    std::mutex       err_mtx;
 };

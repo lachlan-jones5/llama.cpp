@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "llama-moe-residency.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1487,6 +1489,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    moe_res          (params.moe_res),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1539,11 +1542,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// Graph node that turns routed expert ids into slot indices, bringing the experts it needs into the pool
+// on the way. Runs on the host, between the router and the expert matmuls.
+//
+// Single-threaded on purpose: the work is I/O bound and the reader parallelises the reads internally.
+static void llm_moe_resolve_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+
+    if (ith != 0) {
+        return;
+    }
+
+    auto * rc = (llama_moe_resolve_ctx *) userdata;
+
+    const ggml_tensor * ids = dst->src[0];
+
+    // failures are latched in the manager and fail the decode once the graph finishes; resolve() still
+    // leaves dst holding valid slot indices so the matmuls that follow stay in bounds
+    rc->res->resolve(rc->il, (const int32_t *) ids->data, (int32_t) ggml_nelements(ids), (int32_t *) dst->data);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * ids_full) const {
+    // When w is a bounded slot pool, ids indexes slots while everything that is still sized by n_expert -
+    // the per-expert scales and any LoRA weights - has to keep indexing by expert id.
+    if (ids_full == nullptr) {
+        ids_full = ids;
+    }
+
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
@@ -1551,7 +1581,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+        s = ggml_get_rows(ctx0, s, ids_full);
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -1566,8 +1596,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
         ggml_tensor * ab_cur = ggml_mul_mat_id(
                 ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
+                ggml_mul_mat_id(ctx0, lw->a, cur, ids_full),
+                ids_full
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
@@ -2102,6 +2132,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    ggml_tensor * slot_ids = nullptr;
+
+    // Swap each paged expert weight for the bounded pool that stands in for it.
+    //
+    // This has to happen after the routing chain above is complete: the CUDA topk-moe fusion matches a
+    // strictly contiguous SOFT_MAX -> ARGSORT -> GET_ROWS run by src-pointer identity, so anything inserted
+    // between argsort and the get_rows above would silently disable it.
+    //
+    // Only the mul_mat_id weight arguments are redirected. The sibling nodes that consume the same id
+    // tensor - get_rows(probs, ids), add_id(x, exps_b, ids) and the per-expert scale lookup - keep indexing
+    // by expert id, which is what they need, because their weights stay fully resident.
+    if (moe_res != nullptr && moe_res->is_paged_layer(il)) {
+        // put the pools on whatever buffer type this layer's resident weights ended up on, so they follow
+        // the same device placement as the rest of the layer
+        ggml_backend_buffer_type_t buft = nullptr;
+        for (const ggml_tensor * ref : { gate_inp, down_exps_s, up_exps_s }) {
+            if (ref != nullptr && ref->buffer != nullptr) {
+                buft = ggml_backend_buffer_get_type(ref->buffer);
+                break;
+            }
+        }
+
+        auto bind = [&](ggml_tensor * orig) -> ggml_tensor * {
+            if (orig == nullptr) {
+                return nullptr;
+            }
+
+            ggml_tensor * pool = moe_res->bind_pool(il, orig, buft);
+
+            // On failure the error is latched in the residency manager and the decode is aborted before
+            // anything is computed, so returning orig here never reaches a kernel.
+            return pool != nullptr ? pool : orig;
+        };
+
+        gate_up_exps = bind(gate_up_exps);
+        up_exps      = bind(up_exps);
+        gate_exps    = bind(gate_exps);
+        down_exps    = bind(down_exps);
+
+        // The pools hold n_slots experts, not n_expert, so the matmuls below must be indexed by slot.
+        // This node runs on the host between the router and the matmuls: it decides which experts to
+        // admit, reads the missing ones, and emits the slot each routed id landed in.
+        llama_moe_resolve_ctx * rc = moe_res->resolve_ctx(il);
+
+        if (rc != nullptr) {
+            ggml_tensor * ids = selected_experts;
+
+            slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                    ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
+                    &ids, 1, llm_moe_resolve_op, 1, rc);
+
+            cb(slot_ids, "ffn_moe_slot_ids", il);
+        }
+    }
+
+    // Everything except the pooled matmuls keeps indexing by expert id: the routing weights, the
+    // per-expert biases and the per-expert scales are all fully resident and sized by n_expert.
+    ggml_tensor * mm_ids = slot_ids != nullptr ? slot_ids : selected_experts;
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2116,7 +2205,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, mm_ids, up_exps_s, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2135,7 +2224,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, mm_ids, up_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2148,7 +2237,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, mm_ids, gate_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2252,7 +2341,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

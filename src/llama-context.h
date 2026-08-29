@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-residency.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -347,6 +348,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Bounded residency of MoE expert weights, when --moe-n-slots is in use. Declared after backends so it
+    // is destroyed first: it owns backend buffers that must be released before the backends themselves.
+    std::unique_ptr<llama_moe_residency> moe_res;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
