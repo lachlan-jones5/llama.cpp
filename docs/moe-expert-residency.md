@@ -26,10 +26,18 @@ resident at the same time. So:
 n_slots >= min(n_expert, n_expert_used * n_ubatch)
 ```
 
+A ubatch is not bounded by `n_ubatch` alone. With several sequences in flight the batch allocator packs a
+token from each active sequence into one ubatch, so the requirement scales with `--parallel` as well:
+
+```
+n_slots >= min(n_expert, n_expert_used * n_ubatch * n_parallel)
+```
+
 This is checked before inference and refused if it cannot be satisfied, naming the value that would fix it.
-The practical consequence is that **small slot counts require a small microbatch**. For a model using 8
-experts per token, `--moe-n-slots 8` requires `--ubatch-size 1`; at the default `--ubatch-size 512` the same
-model needs 256 slots, which is most of the layer and defeats the purpose.
+The practical consequence is that **small slot counts require a small microbatch and few parallel
+sequences**. For a model using 8 experts per token, `--moe-n-slots 8` requires `--ubatch-size 1` and
+`--parallel 1`; the same model with `--parallel 4` needs 32 slots, and at the default `--ubatch-size 512` it
+needs 256 slots, which is most of the layer and defeats the purpose.
 
 Larger slot counts raise the hit rate and cost more memory. The hit rate is reported at the end of a run.
 
