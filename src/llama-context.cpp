@@ -250,17 +250,26 @@ llama_context::llama_context(
     // Expert paging needs every expert a ubatch routes to resident at the same time, so the pool has to be
     // at least as large as the worst case for this ubatch. n_ubatch is only settled here, which is why this
     // half of the check does not live with the rest in llama_model_load().
+    //
+    // The worst case is not n_ubatch tokens: with several sequences in flight the batch allocator packs a
+    // token from each active sequence into one ubatch, and speculative decoding adds drafted tokens on top,
+    // so a ubatch can carry more tokens than n_ubatch alone suggests. Sizing off n_ubatch alone let that
+    // surface as a failed decode mid-request instead of a clear error at startup.
     if (model.moe_params().n_slots > 0) {
+        const uint32_t n_tokens_max = cparams.n_ubatch * std::max<uint32_t>(1, cparams.n_seq_max);
+
         const uint32_t n_needed = (uint32_t) llama_moe_min_slots(
                 (int32_t) model.hparams.n_expert,
                 (int32_t) model.hparams.n_expert_used,
-                (int32_t) cparams.n_ubatch);
+                (int32_t) n_tokens_max);
 
         if ((uint32_t) model.moe_params().n_slots < n_needed) {
             throw std::runtime_error(format(
-                "--moe-n-slots (%d) is too small for n_ubatch %u: this model uses %u experts per token, "
-                "so %u slots are needed (raise --moe-n-slots or lower --ubatch-size)",
-                model.moe_params().n_slots, cparams.n_ubatch, model.hparams.n_expert_used, n_needed));
+                "--moe-n-slots (%d) is too small: with n_ubatch %u and up to %u sequences a ubatch can "
+                "carry %u tokens, and this model uses %u experts per token, so %u slots are needed "
+                "(raise --moe-n-slots, or lower --ubatch-size or --parallel)",
+                model.moe_params().n_slots, cparams.n_ubatch, cparams.n_seq_max, n_tokens_max,
+                model.hparams.n_expert_used, n_needed));
         }
     }
 

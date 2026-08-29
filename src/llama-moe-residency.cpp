@@ -698,7 +698,11 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
     if (status != LLAMA_MOE_STATUS_OK) {
         // slot 0 always exists, so the matmul reads in-bounds nonsense instead of running off the pool
         std::fill(out_slots, out_slots + n, 0);
-        latch(status, "layer " + std::to_string(il) + ": " + llama_moe_status_str(status));
+
+        // say what was actually asked for - the slot count needed follows from the routed id count
+        latch(status, "layer " + std::to_string(il) + ": " + llama_moe_status_str(status) +
+                " (" + std::to_string(n) + " routed ids, " + std::to_string(layer.cache.n_slots()) +
+                " slots, " + std::to_string(layer.cache.n_expert()) + " experts)");
         return status;
     }
 

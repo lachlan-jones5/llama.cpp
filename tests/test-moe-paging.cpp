@@ -201,6 +201,27 @@ int main(int argc, char ** argv) {
         CHECK(err < 1e-6);
     }
 
+    // Multi-token ubatches are the case that catches id-layout mistakes. ggml_argsort_top_k returns a view
+    // strided by n_expert, so reading the selected ids as a flat array happens to work for a single token
+    // and silently reads the wrong ids for several. Compare a paged multi-token ubatch against a resident
+    // one to keep that from coming back.
+    printf("multi-token ubatch\n");
+    {
+        const uint32_t n_ubatch = 8;
+
+        const run_result ref_multi   = run(path, 0, n_ubatch, true);
+        const run_result paged_multi = run(path, 2, n_ubatch, true);
+
+        CHECK(ref_multi.ok);
+        CHECK(paged_multi.ok);
+
+        if (ref_multi.ok && paged_multi.ok) {
+            const double err = nmse(ref_multi.logits, paged_multi.logits);
+            printf("  ubatch %u: nmse vs resident = %.3e\n", n_ubatch, err);
+            CHECK(err < 1e-6);
+        }
+    }
+
     // A ubatch of N tokens can route to n_expert_used*N distinct experts, all of which must be resident at
     // once, so too few slots for the ubatch has to be refused before inference rather than silently wrong.
     printf("rejected configurations\n");

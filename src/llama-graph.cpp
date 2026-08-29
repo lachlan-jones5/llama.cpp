@@ -1557,6 +1557,10 @@ static void llm_moe_resolve_op(ggml_tensor * dst, int ith, int nth, void * userd
 
     const ggml_tensor * ids = dst->src[0];
 
+    // read as a flat i32 array, so the caller must have made it contiguous
+    GGML_ASSERT(ggml_is_contiguous(ids) && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && dst->type == GGML_TYPE_I32);
+
     // failures are latched in the manager and fail the decode once the graph finishes; resolve() still
     // leaves dst holding valid slot indices so the matmuls that follow stay in bounds
     rc->res->resolve(rc->il, (const int32_t *) ids->data, (int32_t) ggml_nelements(ids), (int32_t *) dst->data);
@@ -2177,7 +2181,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         llama_moe_resolve_ctx * rc = moe_res->resolve_ctx(il);
 
         if (rc != nullptr) {
-            ggml_tensor * ids = selected_experts;
+            // ggml_argsort_top_k returns a view of the full argsort output, so the selected ids are strided
+            // by n_expert, not packed. Materialise them before the resolve reads them as a flat array -
+            // with a single token the difference is invisible, with several it silently reads the wrong ids.
+            ggml_tensor * ids = ggml_cont(ctx0, selected_experts);
+            cb(ids, "ffn_moe_topk_cont", il);
 
             slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                     ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
