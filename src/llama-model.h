@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-moe-residency.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -700,6 +701,9 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // disk location of the expert weights that were paged rather than loaded, keyed by tensor name
+    std::unordered_map<std::string, llama_moe_tensor_info> moe_paged;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

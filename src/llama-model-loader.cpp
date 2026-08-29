@@ -870,6 +870,61 @@ struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string &
     return tensor;
 }
 
+static bool llama_str_ends_with(const std::string & s, const char * suffix) {
+    const size_t n = strlen(suffix);
+
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+bool llama_model_loader::moe_should_page(const std::string & name, const ggml_tensor * cur, int32_t * il_out) const {
+    if (moe.n_slots <= 0 || cur == nullptr) {
+        return false;
+    }
+
+    // Only the routed expert weight matrices are paged. The per-expert biases and scales that share this
+    // base name are tiny and stay resident, and they are indexed by expert id rather than by slot, so
+    // paging them would be wrong as well as pointless.
+    static const char * const paged_suffixes[] = {
+        ".ffn_gate_exps.weight",
+        ".ffn_up_exps.weight",
+        ".ffn_down_exps.weight",
+        ".ffn_gate_up_exps.weight",
+    };
+
+    bool matched = false;
+    for (const char * suffix : paged_suffixes) {
+        if (llama_str_ends_with(name, suffix)) {
+            matched = true;
+            break;
+        }
+    }
+
+    if (!matched) {
+        return false;
+    }
+
+    // experts must be the third dimension for the offset arithmetic to hold
+    if (cur->ne[2] <= 1) {
+        return false;
+    }
+
+    int il = -1;
+    if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+        return false;
+    }
+
+    // n_layers == 0 means every MoE layer
+    if (moe.n_layers > 0 && il >= moe.n_layers) {
+        return false;
+    }
+
+    if (il_out) {
+        *il_out = il;
+    }
+
+    return true;
+}
+
 const struct ggml_tensor * llama_model_loader::check_tensor_dims(
         const std::string & name,
         const std::vector<int64_t> & ne,
@@ -1285,6 +1340,54 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
+    }
+
+    // A paged expert weight gets metadata but no storage. Its context is deliberately outside ctx_map, so
+    // no backend buffer is allocated for it and load_all_data() never reads it; the residency manager reads
+    // the individual experts it needs out of the file instead. The graph never references this tensor - it
+    // is only the handle that ties a layer's experts to their location on disk.
+    {
+        int32_t il = -1;
+        if (moe_should_page(tn.str(), cur, &il)) {
+            const auto & w = require_weight(tn.str().c_str());
+
+            if (ctx_moe == nullptr) {
+                ggml_init_params ctx_params = {
+                    /*.mem_size   =*/ ggml_tensor_overhead()*n_tensors,
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+
+                ctx_moe.reset(ggml_init(ctx_params));
+                if (!ctx_moe) {
+                    throw std::runtime_error("failed to create ggml context for paged expert tensors");
+                }
+            }
+
+            ggml_tensor * tensor = ggml_get_tensor(ctx_moe.get(), tn.str().c_str());
+
+            if (tensor == nullptr) {
+                tensor = ggml_dup_tensor(ctx_moe.get(), cur);
+                ggml_set_name(tensor, tn.str().c_str());
+
+                moe_paged[tn.str()] = {
+                    /*.file_idx =*/ w.idx,
+                    /*.offset   =*/ w.offs,
+                    /*.stride   =*/ cur->nb[2],
+                    /*.n_expert =*/ (int32_t) cur->ne[2],
+                    /*.il       =*/ il,
+                };
+
+                LLAMA_LOG_DEBUG("%s: tensor %s (%d experts of %zu KiB) will be paged\n",
+                        __func__, tn.str().c_str(), (int32_t) cur->ne[2], (size_t) cur->nb[2]/1024);
+            }
+
+            if (!(flags & TENSOR_DUPLICATED)) {
+                n_created++;
+            }
+
+            return tensor;
+        }
     }
 
     if ((flags & TENSOR_READ_LAZY) && use_mmap && lazy_mode != LLAMA_LAZY_MODE_OFF) {

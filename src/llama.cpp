@@ -401,6 +401,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy_mode = params.lazy_mode;
+        ml.moe       = params.moe;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));

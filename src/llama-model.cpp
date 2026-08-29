@@ -1678,6 +1678,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Paged expert tensors live in their own context, so they take no buffer and are never read, but they
+    // are still part of the model by name. Take ownership of the context with an empty buffer list.
+    if (ml.ctx_moe) {
+        for (auto * cur = ggml_get_first_tensor(ml.ctx_moe.get()); cur != NULL; cur = ggml_get_next_tensor(ml.ctx_moe.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+
+        moe_paged = std::move(ml.moe_paged);
+
+        pimpl->ctxs_bufs.emplace_back(std::move(ml.ctx_moe), std::vector<ggml_backend_buffer_ptr>());
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 

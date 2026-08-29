@@ -37,6 +37,16 @@ struct llama_moe_fill {
     int32_t slot;
 };
 
+// Where a paged expert weight lives on disk. Experts are contiguous within the tensor, so expert e starts
+// at offset + e*stride.
+struct llama_moe_tensor_info {
+    uint16_t file_idx;
+    uint64_t offset;    // byte offset of expert 0 in the file
+    uint64_t stride;    // bytes per expert
+    int32_t  n_expert;
+    int32_t  il;        // layer this tensor belongs to
+};
+
 struct llama_moe_layer_stats {
     uint64_t n_resolve = 0;  // resolve() calls
     uint64_t n_lookup  = 0;  // routed ids examined

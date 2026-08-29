@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-moe-residency.h"
 
 #include "ggml-cpp.h"
 
@@ -85,6 +86,7 @@ struct llama_model_loader {
 
     // set by the caller before the create_tensor() calls
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_OFF;
+    llama_moe_params     moe       = { 0, 0, 0 };
 
     llama_files files;
     llama_ftype ftype;
@@ -94,6 +96,15 @@ struct llama_model_loader {
 
     // byte ranges of TENSOR_READ_LAZY tensors, per file index
     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+
+    // expert weights that were given metadata but no storage, keyed by tensor name
+    std::unordered_map<std::string, llama_moe_tensor_info> moe_paged;
+
+    // holds the paged expert tensors; deliberately not in ctx_map so they are neither allocated nor read
+    ggml_context_ptr ctx_moe;
+
+    // true if this tensor should be paged rather than loaded; writes the layer index to il_out
+    bool moe_should_page(const std::string & name, const ggml_tensor * cur, int32_t * il_out) const;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
