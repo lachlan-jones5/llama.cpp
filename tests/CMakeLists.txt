@@ -221,6 +221,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-paging PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # same comparison with the layers offloaded, so the GPU backends are covered where one is present
+    # (falls back to CPU on machines without a GPU, so it is safe to always register)
+    llama_test(
+        test-moe-paging
+        NAME test-moe-paging-gpu
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen3moe-moe.gguf" -ngl 99
+    )
+    set_tests_properties(test-moe-paging-gpu PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
