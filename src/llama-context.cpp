@@ -3419,6 +3419,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_res) {
+        // Slot pools hold model weights and follow their layer's device placement, so they scale with the
+        // layers offloaded and belong with the model. Nothing else counts them: they are neither model
+        // buffers nor memory-module buffers nor scheduler compute buffers. Left out, a paged model looks
+        // far smaller than it is and --fit offloads more layers than will actually fit.
+        for (const auto & [buft, size] : moe_res->memory_breakdown()) {
+            ret[buft].model += size;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();

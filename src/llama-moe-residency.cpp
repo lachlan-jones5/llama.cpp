@@ -953,6 +953,22 @@ llama_moe_layer_stats llama_moe_residency::total_stats() const {
     return out;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_moe_residency::memory_breakdown() const {
+    std::map<ggml_backend_buffer_type_t, size_t> out;
+
+    for (const auto & layer : layers) {
+        for (const auto & pool : layer.pools) {
+            if (!pool.buf) {
+                continue;
+            }
+
+            out[ggml_backend_buffer_get_type(pool.buf.get())] += ggml_backend_buffer_get_size(pool.buf.get());
+        }
+    }
+
+    return out;
+}
+
 void llama_moe_residency::reset_stats() {
     for (auto & layer : layers) {
         layer.cache.reset_stats();

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -309,6 +310,14 @@ struct llama_moe_residency {
     void reset_stats();
 
     int32_t slots() const { return n_slots; }
+
+    // Bytes the slot pools occupy, keyed by the buffer type each was allocated on. Pools are created during
+    // graph building, so this is empty until a graph has been built - but the reserve pass in the context
+    // constructor builds one, so it is populated by the time anything asks.
+    //
+    // Callers need this because a pool is not a model buffer, not a memory-module buffer and not a
+    // scheduler compute buffer, so nothing else in the memory breakdown accounts for it.
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // Tokens per expert-matmul group. Every expert a group routes to must be resident at once, so this -
     // not the microbatch - is what the slot count bounds.
