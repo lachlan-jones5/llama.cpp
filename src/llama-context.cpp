@@ -2394,6 +2394,26 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // Expert paging rebuilds the expert region once per token group rather than once per layer, so the node
+    // count scales with the number of groups. Budget for that explicitly; the alternative is a hard abort in
+    // ggml_graph_add_node, or a null return from ggml_new_object and a segfault, neither of which is a
+    // diagnosable failure. Only paged models pay this.
+    if (model.moe_params().n_slots > 0) {
+        const int32_t n_eu = std::max<int32_t>(1, (int32_t) model.hparams.n_expert_used);
+
+        const int32_t chunk = model.moe_params().n_chunk_size > 0
+            ? model.moe_params().n_chunk_size
+            : std::max<int32_t>(1, model.moe_params().n_slots / n_eu);
+
+        const uint32_t n_groups = (n_tokens + chunk - 1) / chunk;
+
+        // generous per-layer allowance for the expert region: the matmuls, activation, per-expert biases
+        // and scales, the per-expert views and the reduction adds
+        const uint32_t n_moe_nodes = 64 + 4*(uint32_t) model.hparams.n_expert_used;
+
+        res = std::max(res, n_groups * n_moe_nodes * model.hparams.n_layer_all + n_tokens * 8);
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
