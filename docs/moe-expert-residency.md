@@ -13,31 +13,29 @@ model does not fit, but its working set does.**
 | --- | --- |
 | `--moe-n-slots N` | Keep `N` experts of each paged layer resident. `0` (default) disables paging entirely. |
 | `--moe-n-layers N` | Page only the first `N` MoE layers. `0` (default) pages every MoE layer. |
+| `--moe-chunk-size N` | Tokens per expert-matmul group. `0` (default) derives it as `n_slots / n_expert_used`. |
 | `--moe-read-threads N` | Threads used to read experts. `0` (default) picks a sensible number. |
 
 Each has a matching `LLAMA_ARG_*` environment variable.
 
 ### Choosing a slot count
 
-A ubatch of `N` tokens can route to `n_expert_used * N` distinct experts, and every one of them has to be
-resident at the same time. So:
+A group of `N` tokens can route to `n_expert_used * N` distinct experts, and every one of them has to be
+resident at the same time. So the slot count sets the group size:
 
 ```
-n_slots >= min(n_expert, n_expert_used * n_ubatch)
+group = n_slots / n_expert_used          (or --moe-chunk-size, if given)
 ```
 
-A ubatch is not bounded by `n_ubatch` alone. With several sequences in flight the batch allocator packs a
-token from each active sequence into one ubatch, so the requirement scales with `--parallel` as well:
+The slot count is therefore just a memory budget: how many experts of each layer you are willing to keep
+resident. It does **not** constrain `--ubatch-size` or `--parallel` — the expert path is split into groups
+that fit, so a large microbatch is fine. Only two things are refused, both at load with the numbers named:
+fewer slots than `n_expert_used` (a single token would not fit), and an explicit `--moe-chunk-size` larger
+than the pool can hold.
 
-```
-n_slots >= min(n_expert, n_expert_used * n_ubatch * n_parallel)
-```
-
-This is checked before inference and refused if it cannot be satisfied, naming the value that would fix it.
-The practical consequence is that **small slot counts require a small microbatch and few parallel
-sequences**. For a model using 8 experts per token, `--moe-n-slots 8` requires `--ubatch-size 1` and
-`--parallel 1`; the same model with `--parallel 4` needs 32 slots, and at the default `--ubatch-size 512` it
-needs 256 slots, which is most of the layer and defeats the purpose.
+This was not always true. Before token grouping the bound applied to the whole microbatch, so
+`--moe-n-slots 8` required `--ubatch-size 1` and `--parallel 1`, and a 4-slot server needed 32 experts
+resident. If you are reading older notes or configurations, that is why.
 
 ### Token groups: the microbatch is no longer what the slots bound
 
