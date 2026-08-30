@@ -27,14 +27,26 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
 ```
 
-Build the non-embedded shader path too, since upstream CI only exercises one of them:
+Build the non-embedded shader path too, since upstream CI only exercises one of them. Note it needs Xcode's
+optional Metal toolchain selected explicitly — `xcrun -sdk macosx metal` will not find it otherwise:
 
 ```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+TOOLCHAINS=<com.apple.dt.toolchain.Metal.*> \
 cmake -B build-noembed -DCMAKE_BUILD_TYPE=Release -DGGML_METAL_EMBED_LIBRARY=OFF -DGGML_METAL_SHADER_DEBUG=ON
 cmake --build build-noembed -j $(sysctl -n hw.logicalcpu)
 ```
 
-- [ ] both configurations build with no warnings
+- [ ] both configurations build
+- [ ] no **new** warnings in files this branch touches
+
+> Do not treat the non-embedded path as a gate on this work. It has a pre-existing upstream defect,
+> independent of expert paging: the build-time `metal` invocation passes no feature macros, so the prebuilt
+> `default.metallib` contains no BF16 kernels, while the runtime advertises `has_bfloat` on capable hardware
+> and asks for them anyway. On an M5 Pro this makes `test-backend-ops -b MTL0 -o MUL_MAT_ID` abort with
+> *"Function kernel_mul_mv_id_bf16_f32_4 was not found in the library"*. The MoE tests pass on that build —
+> the missing kernels are BF16 variants a Q6_K model never uses. Likewise `upscale.metal`'s unused
+> `bilinear_tri` warning is upstream and untouched by this branch.
 
 ## 2. Unit and equivalence tests
 
@@ -61,7 +73,10 @@ The Metal device is named `MTL0` (`ggml-metal-device.m` builds it as `"MTL" + in
 ./bin/test-backend-ops test -b MTL0 -o SOFT_MAX
 ```
 
-- [ ] all four report OK (the reference run on CUDA0 gave 872/872 for `MUL_MAT_ID`)
+- [ ] all four report OK on the **embedded** build (the reference run on CUDA0 gave 872/872 for `MUL_MAT_ID`)
+
+On the non-embedded build `MUL_MAT_ID` is expected to abort on the first BF16 case for the upstream reason
+above. That is not a result about this branch; record it and move on.
 
 ## 4. Real model
 
