@@ -209,27 +209,30 @@ int main(int argc, char ** argv) {
     {
         const uint32_t n_ubatch = 8;
 
-        const run_result ref_multi   = run(path, 0, n_ubatch, true);
-        const run_result paged_multi = run(path, 2, n_ubatch, true);
-
+        const run_result ref_multi = run(path, 0, n_ubatch, true);
         CHECK(ref_multi.ok);
-        CHECK(paged_multi.ok);
 
-        if (ref_multi.ok && paged_multi.ok) {
-            const double err = nmse(ref_multi.logits, paged_multi.logits);
-            printf("  ubatch %u: nmse vs resident = %.3e\n", n_ubatch, err);
-            CHECK(err < 1e-6);
+        // Slot counts below n_expert_used * n_ubatch used to be refused outright. The expert path is now
+        // split into groups small enough for the pool, so they must work - and must still be exact.
+        //
+        // One slot with an 8-token microbatch is the hardest case: the pool holds a single expert, so every
+        // group evicts the previous group's. If a later group's admission could disturb a group whose matmul
+        // has not run yet, this is where it would show up as wrong logits rather than a crash.
+        for (const int32_t n_slots : { 2, 1 }) {
+            const run_result paged_multi = run(path, n_slots, n_ubatch, true);
+            CHECK(paged_multi.ok);
+
+            if (ref_multi.ok && paged_multi.ok) {
+                const double err = nmse(ref_multi.logits, paged_multi.logits);
+                printf("  ubatch %u, %d slots: nmse vs resident = %.3e\n", n_ubatch, n_slots, err);
+                CHECK(err < 1e-6);
+            }
         }
     }
 
     // A ubatch of N tokens can route to n_expert_used*N distinct experts, all of which must be resident at
     // once, so too few slots for the ubatch has to be refused before inference rather than silently wrong.
     printf("rejected configurations\n");
-    {
-        const run_result too_small = run(path, 1, 8, false);
-        CHECK(!too_small.ok);
-        printf("  1 slot with ubatch 8: %s\n", too_small.ok ? "accepted (BAD)" : "rejected");
-    }
     {
         // more slots than the layer has experts is a configuration error
         const run_result too_many = run(path, 1024, 1, false);

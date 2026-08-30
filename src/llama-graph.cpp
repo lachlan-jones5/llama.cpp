@@ -2136,7 +2136,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    ggml_tensor * slot_ids = nullptr;
+    llama_moe_resolve_ctx * rc = nullptr;
 
     // Swap each paged expert weight for the bounded pool that stands in for it.
     //
@@ -2176,32 +2176,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps    = bind(down_exps);
 
         // The pools hold n_slots experts, not n_expert, so the matmuls below must be indexed by slot.
-        // This node runs on the host between the router and the matmuls: it decides which experts to
-        // admit, reads the missing ones, and emits the slot each routed id landed in.
-        llama_moe_resolve_ctx * rc = moe_res->resolve_ctx(il);
-
-        if (rc != nullptr) {
-            // ggml_argsort_top_k returns a view of the full argsort output, so the selected ids are strided
-            // by n_expert, not packed. Materialise them before the resolve reads them as a flat array -
-            // with a single token the difference is invisible, with several it silently reads the wrong ids.
-            ggml_tensor * ids = ggml_cont(ctx0, selected_experts);
-            cb(ids, "ffn_moe_topk_cont", il);
-
-            slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
-                    ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
-                    &ids, 1, llm_moe_resolve_op, 1, rc);
-
-            cb(slot_ids, "ffn_moe_slot_ids", il);
-        }
+        rc = moe_res->resolve_ctx(il);
     }
 
-    // Everything except the pooled matmuls keeps indexing by expert id: the routing weights, the
-    // per-expert biases and the per-expert scales are all fully resident and sized by n_expert.
-    ggml_tensor * mm_ids = slot_ids != nullptr ? slot_ids : selected_experts;
+    // Turns a group's routed expert ids into slot indices, admitting and reading whatever is missing on the
+    // way. One of these runs per group, so a group only ever needs its own experts resident at once.
+    auto resolve_ids = [&](ggml_tensor * sel) -> ggml_tensor * {
+        if (rc == nullptr) {
+            return sel;
+        }
 
-    const moe_expert_args margs = {
+        // ggml_argsort_top_k returns a view of the full argsort output, so the selected ids are strided
+        // by n_expert, not packed. Materialise them before the resolve reads them as a flat array -
+        // with a single token the difference is invisible, with several it silently reads the wrong ids.
+        ggml_tensor * ids = ggml_cont(ctx0, sel);
+        cb(ids, "ffn_moe_topk_cont", il);
+
+        ggml_tensor * slots = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
+                &ids, 1, llm_moe_resolve_op, 1, rc);
+
+        cb(slots, "ffn_moe_slot_ids", il);
+
+        return slots;
+    };
+
+    moe_expert_args margs = {
         /*.cur              =*/ cur,
-        /*.mm_ids           =*/ mm_ids,
+        /*.mm_ids           =*/ nullptr,
         /*.selected_experts =*/ selected_experts,
         /*.weights          =*/ weights,
         /*.gate_up_exps     =*/ gate_up_exps,
@@ -2221,7 +2223,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.il               =*/ il,
     };
 
-    return build_moe_experts(margs);
+    // How many tokens share one expert matmul. Every expert a group routes to has to be resident at the
+    // same time, which is what the slot pool bounds - so this, not the microbatch, is what the slot count
+    // constrains. Without paging there is nothing to bound and the whole microbatch is one group.
+    const int64_t chunk = rc != nullptr ? moe_res->chunk_size() : 0;
+
+    if (chunk <= 0 || n_tokens <= chunk) {
+        margs.mm_ids = resolve_ids(selected_experts);
+
+        return build_moe_experts(margs);
+    }
+
+    // Chunked: attention and the dense path already ran over the whole microbatch; only the expert path is
+    // split. The MoE FFN is per-token, so this is a regrouping of identical arithmetic.
+    ggml_tensor * moe_out = ggml_scale(ctx0, cur, 0.0f); // destination, fully overwritten below
+
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t nc = std::min<int64_t>(chunk, n_tokens - t0);
+
+        // ids are [n_expert_used, n_tokens] -> slice the token axis, ne[1]
+        ggml_tensor * sel_c = ggml_view_2d(ctx0, selected_experts,
+                selected_experts->ne[0], nc,
+                selected_experts->nb[1], t0*selected_experts->nb[1]);
+
+        // cur is [n_embd, n_tokens] and weights is [1, n_expert_used, n_tokens] -> token axis differs
+        margs.cur = ggml_view_2d(ctx0, cur, cur->ne[0], nc, cur->nb[1], t0*cur->nb[1]);
+
+        margs.weights = ggml_view_3d(ctx0, weights,
+                weights->ne[0], weights->ne[1], nc,
+                weights->nb[1], weights->nb[2], t0*weights->nb[2]);
+
+        margs.selected_experts = sel_c;
+        margs.mm_ids           = resolve_ids(sel_c);
+
+        ggml_tensor * part = build_moe_experts(margs);
+
+        moe_out = ggml_set_inplace(ctx0, moe_out, part,
+                moe_out->nb[1], moe_out->nb[2], moe_out->nb[3], t0*moe_out->nb[1]);
+    }
+
+    cb(moe_out, "ffn_moe_out_chunked", il);
+
+    return moe_out;
 }
 
 ggml_tensor * llm_graph_context::build_moe_experts(const moe_expert_args & args) const {
