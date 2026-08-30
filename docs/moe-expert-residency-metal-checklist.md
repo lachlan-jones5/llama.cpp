@@ -1,10 +1,25 @@
 # Metal acceptance checklist for MoE expert residency
 
-Everything in this checklist has to be run on Apple hardware. It has **not** been run — the development host
-is Linux and cannot validate the Metal backend. Nothing below should be reported as passing until it has
-actually been executed on the Mac.
+Everything in this checklist has to be run on Apple hardware — the development host is Linux and cannot
+validate the Metal backend, so nothing below may be reported as passing until it has actually been executed
+on the Mac.
 
 Branch: `moe-expert-residency-portable`, based on `official/master`.
+
+## Result of the last run
+
+**Passed in full at tip `5910a9559`** on an Apple M5 Pro (Mac17,8, 25.8 GB, Xcode 26.6), against
+Qwen3-30B-A3B-Q6_K, hash verified before and after. Embedded and non-embedded builds both clean; `ctest -L
+main -E test-llama-archs` 55/55; `test-moe-paging-gpu` on MTL0 with real misses and evictions at nmse 0.0;
+`MUL_MAT_ID` 802/802, `GET_ROWS` 115/115, `SOFT_MAX` 212/212. Outputs byte-identical across 8/16/32 slots.
+Every refusal, the concurrency run, the fault injection and both server lifecycles behaved as specified. The
+only negative was the already-scoped upstream non-embedded BF16 metallib defect.
+
+Measurements from that run are recorded in `moe-expert-residency.md`; do not re-derive them here.
+
+**Two things changed after that run and are therefore unvalidated on Metal:** slot pools are now counted in
+the memory breakdown, and the fit pass no longer aborts when paging is on. Re-run sections 1, 2 and 5 when
+the next tip is sent, and note that `--fit off` is no longer required.
 
 ## What to expect
 

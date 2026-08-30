@@ -61,10 +61,29 @@ into a pair of graph splits with a device synchronisation, so the split count gr
 groups and eats most of the batching win. That is also why the gain flattens almost immediately —
 microbatch 64 already captures three quarters of what 512 does.
 
+**On Metal the same change is worth far more.** Validated on an M5 Pro with Qwen3-30B-A3B-Q6_K, `pp32`,
+microbatch 64 against microbatch 1:
+
+| Slots | Warm prefill | Cold prefill |
+| ---: | ---: | ---: |
+| 8 | +24.5 % | +19.2 % |
+| 16 | +35.0 % | +36.2 % |
+| 32 | **+54.1 %** | **+48.5 %** |
+
+Generation is unchanged on both backends, which is the expected shape — one token is one group and takes the
+ungrouped path. Do not read the CUDA figure as the general case: the benefit depends on how much the
+attention and dense path care about batch size on that backend, and Metal cares a great deal more. Both
+measurements are small-`pp` tests; treat them as evidence that the effect is large and backend-dependent,
+not as a number to quote for a long prompt.
+
 **So prefer a modest microbatch.** 64 gets most of the benefit for 20k nodes; 512 costs 72k nodes, and at
 roughly 21.5 KB per node — dominated by the scheduler's context buffer, not tensor overhead — that is about
-1.5 GB of host memory against 250 MB. Generation is unaffected either way: one token is one group and takes
-the ungrouped path.
+1.5 GB of host memory against 250 MB.
+
+**A small slot count with a large microbatch is a trap.** The group is `n_slots / n_expert_used`, so
+`--moe-n-slots 8` on an 8-expert-per-token model gives a group of 1 and needs one group per token: at
+`--ubatch-size 512` that is 512 groups per layer, and the node budget it implies can exceed available memory
+outright. Pair a small slot count with a small microbatch.
 
 ### The saturation point applies to the group, not the microbatch
 
@@ -152,6 +171,31 @@ Three things in that data are worth taking seriously:
 - **More slots is not reliably faster.** Going from 8 to 32 slots more than doubles the hit rate (26 % to
   56 %) and reads 40 % fewer bytes, yet cold throughput is unchanged, because what remains is more scattered
   and the read time barely moves. Slot count buys memory predictability more than speed.
+### Metal (Apple unified memory)
+
+Validated on an M5 Pro (25.8 GB) with Qwen3-30B-A3B-Q6_K, `-ngl 99`, `llama-bench -p 32 -n 16 -r 3`. Cold
+runs evicted the file by streaming 49.6 GiB of unrelated model files and confirming the reads reached the
+SSD through `disk0` counters, since `purge` needs root.
+
+| Slots | ub | Prefill warm / cold | Generation warm | Hit rate (tg) | Peak bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 1 | 10.02 / 10.18 | 9.27 | 29.1 % | 3.24 GB |
+| 16 | 1 | 10.32 / 10.10 | 8.81 | 54.1 % | 4.73 GB |
+| 32 | 1 | 10.63 / 10.61 | 9.09 | 69.4 % | 7.70 GB |
+| 8 | 64 | 12.47 / 12.13 | 9.54 | 29.1 % | 3.31 GB |
+| 16 | 64 | 13.93 / 13.76 | 9.22 | 54.1 % | 4.75 GB |
+| 32 | 64 | 16.38 / 15.76 | 9.05 | 69.4 % | 7.71 GB |
+
+Two things differ from the CPU picture and are worth knowing:
+
+- **Cold and warm are within noise of each other**, and every run reported zero swaps. On this hardware
+  storage is fast enough that reads are not the limiting factor, so byte-count improvements matter much less
+  here than they do on a slower disk. Do not assume a policy change that reads fewer bytes will show up as
+  throughput on a Mac.
+- **The slot pools are not in the backend's printed Metal subtotal** — that reports only model, KV and
+  compute. They are real, and they appear in the process peak; the memory breakdown accounts for them
+  separately.
+
 - **Paging on top of `mmap` is a pure loss.** With the default mmap loading, the same sweep produced *higher*
   peak RSS than full residency (15.6 GB at 8 slots against 15.1 GB resident) and lower throughput: the whole
   file is mapped either way and the pools are simply added on top. Expert paging is worth using with
@@ -194,7 +238,11 @@ the application". Worth revisiting only if the split cost is ever shown to matte
 the one configuration where splits do grow (+2 per paged layer, ~96 for a 48-layer model). Measure there
 before assuming the CUDA result carries over.
 
-**Done: read straight into unified memory.** Experts used to be read into a staging buffer and handed over
+**Done: read straight into unified memory** — and it was the single largest win in the feature's history.
+Validated on an M5 Pro, like-for-like at 8 slots and microbatch 1: generation went from **6.6 to 11.2 t/s,
++69.7 %**, at an unchanged 3.29 GB footprint and with correctness confirmed bit-exact beforehand. That also
+overtakes the original proof of concept's 10.1 t/s by 10.9 %, closing a gap that had been open since the
+rewrite. Experts used to be read into a staging buffer and handed over
 with `ggml_backend_tensor_set` on every backend whose buffers are not host-addressable. Metal reports
 `ggml_backend_buffer_is_host() == false` for all of its buffer types even when the memory is genuinely
 unified, so it took that path and paid a full second copy of every expert byte. Backends can now answer a
@@ -243,7 +291,9 @@ Same reads, same evictions, **+36 % prefill purely from batching**, and 4 is as 
 is exactly the ceiling chunking would lift, and the no-paging figures above show substantial headroom past 4.
 
 A useful signal that prefill is being crippled: on Metal at microbatch 1, `pp` and `tg` were 7.29 and 6.18
-tok/s, barely apart, where a healthy configuration has prefill several times generation.
+tok/s, barely apart, where a healthy configuration has prefill several times generation. Both halves of that
+have since been addressed — direct reads lifted generation and grouping lifted prefill — so the symptom is
+worth remembering as a diagnostic rather than as a current result.
 
 Also note the trade: smaller groups amortise each expert read across fewer tokens, and a group boundary can
 evict what the next group needs, so bytes read would rise.
