@@ -87,6 +87,16 @@ microbatch 1, `--load-mode none`. Host: Linux, 23 GiB RAM, NVMe.
 So on this host paging buys a **5.6x smaller footprint for roughly a third of the throughput warm, and
 somewhat under half cold**.
 
+Those are 16-token runs, which are dominated by the compulsory misses of a cold pool. Longer runs amortise
+them and land considerably better — the same cold 32-slot configuration over 128 tokens:
+
+| Tokens | Hit rate | tg t/s cold | vs resident |
+| ---: | ---: | ---: | ---: |
+| 16 | 56.1 % | 5.07 | −44 % |
+| 128 | **72.2 %** | **6.71** | **−26 %** |
+
+Quote the longer figure when describing steady-state behaviour; the short one measures pool warm-up.
+
 Three things in that data are worth taking seriously:
 
 - **Warm numbers flatter the feature badly.** The warm run reads experts at 9.6 GiB/s, which is page cache,
@@ -99,6 +109,27 @@ Three things in that data are worth taking seriously:
   peak RSS than full residency (15.6 GB at 8 slots against 15.1 GB resident) and lower throughput: the whole
   file is mapped either way and the pools are simply added on top. Expert paging is worth using with
   `--load-mode none`, where the expert bytes genuinely never enter the process.
+
+### Where the remaining cost is, and where it is not
+
+The refill runs as a host graph node, which the GPU backends do not implement, so the scheduler splits the
+graph around it. That sounds expensive and mostly is not:
+
+- **Splits only grow when the paged layer is entirely GPU-resident.** Measured on CUDA: a fully offloaded
+  model goes from 2 splits to 6 with two paged layers, i.e. **+2 per paged layer**. But with partial offload —
+  the situation you are actually in when a model does not fit — the graph is already split-heavy and paging
+  changes nothing: 62 splits with paging off, 62 with two layers paged, 62 with all layers paged.
+- **The overhead is about 22.8 µs per paged layer per token**, measured on a fully offloaded model where
+  reads are trivial (2413.6 → 2174.6 tok/s with two paged layers). For a 48-layer model at 10 tok/s that is
+  ~1.1 ms of a 100 ms token, near **1 %** — and even that figure includes the admission and read work itself,
+  not just the split.
+- **Read concurrency is not the lever either.** 4, 16 and 32 read threads all give the same cold bandwidth
+  (2062 / 2062 / 2045 MiB/s), because queue depth is bounded by the number of misses in a layer, not by the
+  number of threads.
+
+What is left is the disk reads themselves, which are inherently serialised against the compute that needs
+them. Making paging materially faster means reading *less* (a higher hit rate) or reading *earlier*
+(overlapping a layer's reads with compute that does not depend on them) — not removing graph splits.
 
 ## How it works
 
