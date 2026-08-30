@@ -268,6 +268,11 @@ struct llama_moe_pool {
     // True when the pool buffer can be written through a plain host pointer, so an expert can be read
     // straight into its slot. False for device memory, where the read goes to staging and is then copied in.
     bool host_writable = false;
+
+    // True for a weight the layer does not consume until later in its own FFN - in practice the down
+    // projection, which is not needed until the gate/up matmuls have produced their activation. Those reads
+    // are started by resolve() and collected by wait_deferred(), so they run while the matmuls do.
+    bool deferred = false;
 };
 
 // All pools of one layer share a residency map, so they evict in lockstep and a single remapped id array
@@ -307,7 +312,11 @@ struct llama_moe_residency {
     // Called while the graph is built: hands back the pool tensor that replaces orig, allocating it on
     // first use in the same buffer type as the layer's resident weights. Returns null if orig is not a
     // paged tensor or the pool could not be allocated; the error is latched either way.
-    ggml_tensor * bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft);
+    //
+    // deferred marks a weight the FFN does not consume until after its earlier matmuls, so its read can be
+    // left in flight; the caller must then place a wait_deferred() before whatever reads the pool.
+    ggml_tensor * bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft,
+            bool deferred = false);
 
     // true if this layer has anything paged
     bool is_paged_layer(int32_t il) const;
@@ -319,6 +328,10 @@ struct llama_moe_residency {
     // reads in-bounds nonsense rather than running off the end of the pool; the error is latched and the
     // decode is failed once the graph finishes.
     llama_moe_status resolve(int32_t il, const int32_t * ids, int32_t n, int32_t * out_slots);
+
+    // Collect the deferred reads resolve() left in flight for this layer, and hand any staged experts to the
+    // backend. Must run before anything reads a deferred pool. Safe to call when nothing is outstanding.
+    llama_moe_status wait_deferred(int32_t il);
 
     // Stable per-layer handle for the graph node that performs the resolve. Valid until shutdown.
     llama_moe_resolve_ctx * resolve_ctx(int32_t il);
@@ -382,6 +395,13 @@ private:
     std::vector<llama_moe_fill>     fills;   // scratch, reused across resolves
     std::vector<llama_moe_read_req> reqs;    // scratch, reused across resolves
     std::vector<staged_copy>        staged;  // scratch, reused across resolves
+
+    // Separate scratch for the deferred batch. It cannot share the vectors above: the reader holds a bare
+    // pointer into it until wait_deferred(), so the next resolve() must be free to refill its own without
+    // disturbing a read that is still running.
+    std::vector<llama_moe_read_req> reqs_deferred;
+    std::vector<staged_copy>        staged_deferred;
+    int32_t                         il_deferred = -1;  // layer owning the outstanding batch, -1 if none
 
     // Reusable staging for pools that cannot be written directly. Allocated once and grown as needed, never
     // per token. Pinned when the backend provides a host buffer type, otherwise ordinary memory.
