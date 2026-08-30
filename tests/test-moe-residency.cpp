@@ -129,8 +129,8 @@ static void test_repeated_id_fills_once() {
     CHECK(slots[2] == slots[3]);
 }
 
-static void test_lru_eviction_order() {
-    printf("test_lru_eviction_order\n");
+static void test_lfu_eviction_order() {
+    printf("test_lfu_eviction_order\n");
 
     llama_moe_layer_cache cache;
     CHECK(cache.init(0, 8, 2) == LLAMA_MOE_STATUS_OK);
@@ -138,21 +138,41 @@ static void test_lru_eviction_order() {
     std::vector<int32_t>        slots;
     std::vector<llama_moe_fill> fills;
 
-    // fill both slots: 0 is older than 1
+    // 0 is routed often, 1 rarely but more recently. This is the case where frequency and recency disagree:
+    // LRU would evict 0 because it has not been touched for two ubatches, which is exactly the wrong answer.
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
     CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
     CHECK(run(cache, {1}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {1}, slots, fills) == LLAMA_MOE_STATUS_OK);
 
-    // touch 0 so that 1 becomes the least recently used
-    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
-    CHECK(fills.empty());
-
-    // admitting 2 must displace 1, not 0
+    // admitting 2 must displace the rarely routed 1, keeping the popular 0
     CHECK(run(cache, {2}, slots, fills) == LLAMA_MOE_STATUS_OK);
     CHECK(fills.size() == 1);
     CHECK(cache.slot_of(1) == -1);
     CHECK(cache.slot_of(0) != -1);
     CHECK(cache.slot_of(2) != -1);
     CHECK(cache.stats().n_evict == 1);
+}
+
+static void test_recency_breaks_frequency_ties() {
+    printf("test_recency_breaks_frequency_ties\n");
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(0, 8, 2) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // both routed exactly once, so only recency separates them
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {1}, slots, fills) == LLAMA_MOE_STATUS_OK);
+
+    // 2 displaces the older of the two
+    CHECK(run(cache, {2}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(cache.slot_of(0) == -1);
+    CHECK(cache.slot_of(1) != -1);
+    CHECK(cache.slot_of(2) != -1);
 }
 
 static void test_in_ubatch_pinning() {
@@ -594,7 +614,8 @@ int main() {
     test_init_validation();
     test_miss_then_hit();
     test_repeated_id_fills_once();
-    test_lru_eviction_order();
+    test_lfu_eviction_order();
+    test_recency_breaks_frequency_ties();
     test_in_ubatch_pinning();
     test_minimum_slot_boundary();
     test_invalid_expert_id();

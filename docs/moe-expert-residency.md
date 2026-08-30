@@ -298,10 +298,35 @@ worth remembering as a diagnostic rather than as a current result.
 Also note the trade: smaller groups amortise each expert read across fewer tokens, and a group boundary can
 evict what the next group needs, so bytes read would rise.
 
-**Candidate: read fewer bytes.** At 32 slots over 128 cold tokens the hit rate is 72.2 %, so there is
-headroom, and every avoided miss is ~400 KiB not read. Options: pin a per-layer hot set that is never
-evicted, refuse admission to experts routed only once in a ubatch, or carry residency across the requests of
-one conversation. Payoff is uncertain — the routing may simply be too diffuse.
+**Done, but only half of it worked: read fewer bytes.** Eviction now goes by frequency rather than recency
+(see *How it works*). Replaying routing traces offline, that reads 12 % fewer bytes at 32 slots over 128
+tokens and 20 % over 453, against a Belady bound of 38-44 %. The implementation reproduces the replay
+exactly — 10091 misses predicted, 10091 measured.
+
+**It does not make anything faster here, and the reason is worth recording.** Cold, 32 slots, 128 tokens:
+
+| | LRU | LFU |
+| --- | ---: | ---: |
+| Bytes read | 13751 MiB | 12098 MiB (−12.0 %) |
+| Read time | 3779 ms | 3670 ms (−2.9 %) |
+| Effective read bandwidth | 3639 MiB/s | 3297 MiB/s |
+| `tg128` | 6.73 | 6.76 |
+
+Twelve percent fewer bytes bought three percent less read time, because the bytes that remain are worse:
+keeping the popular experts resident means the misses that are left are the rare, scattered ones, and
+effective bandwidth falls accordingly. Throughput is unchanged within run-to-run variance. Warm is likewise
+a wash (7.87 ± 0.23 against 8.02 ± 0.08).
+
+So the byte reduction is real, repeatable and deterministic, and the throughput gain is not there on an NVMe
+host. It should matter more where storage is genuinely slow and less on Apple hardware, where cold and warm
+are already within noise. Keep it for the I/O reduction, not for speed, and do not quote a throughput number
+for it.
+
+Two ideas from this line are still untried: refusing admission to experts routed only once in a ubatch, and
+carrying residency across the requests of one conversation. Note also that `use_count` never decays, so a
+very long session could in principle keep an expert that was popular early; halving the counters
+periodically was tested offline and made no difference over 453 tokens, which is not long enough to settle
+it.
 
 **Not a lever: read concurrency.** Already measured — 4, 16 and 32 read threads give identical cold
 bandwidth, because queue depth is bounded by the number of misses in a layer, not by the number of threads.
@@ -314,9 +339,13 @@ and their bytes are never read at load time. Each is replaced in the graph by a 
 experts, allocated on whatever buffer type the rest of the layer landed on.
 
 The routed expert ids only exist once the router has run, so a node between the router and the expert
-matmuls turns expert ids into slot indices, reading in whatever is missing on the way. Admission is LRU, and
-slots touched by the current ubatch are pinned so an expert admitted early cannot be evicted by a later token
-in the same ubatch.
+matmuls turns expert ids into slot indices, reading in whatever is missing on the way. Eviction takes the
+least frequently routed expert, with recency as the tiebreak — routing is skewed enough that how often an
+expert is used predicts reuse better than how recently. Slots touched by the current ubatch are pinned so an
+expert admitted early cannot be evicted by a later token in the same ubatch.
+
+The policy cannot affect results. It chooses which slot holds an expert, never which expert is used, so the
+equivalence tests hold whatever it decides.
 
 Only the expert matmuls are indexed by slot. Routing weights, per-expert biases, per-expert scales and LoRA
 weights are all still sized by `n_expert` and keep indexing by expert id.

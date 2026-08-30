@@ -100,7 +100,8 @@ struct llama_moe_layer_cache {
     void reset_stats() { st = {}; }
 
 private:
-    // least recently used slot that is not pinned by the current resolve(), or -1 if all are pinned
+    // Slot to evict: the least frequently routed expert that is not pinned by the current resolve(), with
+    // recency as the tiebreak. -1 if every slot is pinned.
     int32_t evict_victim() const;
 
     int32_t il    = -1;
@@ -110,6 +111,7 @@ private:
     std::vector<int32_t> expert_to_slot;  // n_exp entries, -1 when not resident
     std::vector<int32_t> slot_to_expert;  // n_slot entries, -1 when empty
     std::vector<uint64_t> lru_clock;      // n_slot entries, last touch
+    std::vector<uint64_t> use_count;      // n_exp entries, times routed - survives eviction, which is the point
     std::vector<bool>     pinned;         // n_slot entries, in use by the current resolve()
 
     uint64_t clock = 0;
