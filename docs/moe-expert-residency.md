@@ -39,26 +39,52 @@ sequences**. For a model using 8 experts per token, `--moe-n-slots 8` requires `
 `--parallel 1`; the same model with `--parallel 4` needs 32 slots, and at the default `--ubatch-size 512` it
 needs 256 slots, which is most of the layer and defeats the purpose.
 
-### The saturation point — paging and large-microbatch prefill are incompatible
+### Token groups: the microbatch is no longer what the slots bound
 
-That bound saturates, and it saturates early. Once `n_expert_used × n_ubatch × n_parallel` reaches
-`n_expert`, every expert in the layer must be resident and paging buys nothing at all. So paging only has
-headroom while:
+The expert path runs in **groups** of `--moe-chunk-size` tokens (default `n_slots / n_expert_used`).
+Attention and the dense path still see the whole microbatch; only the expert matmuls are grouped. Since the
+MoE FFN is per-token this is a regrouping of identical arithmetic, and it is verified bit-exact.
+
+The consequence is that the bound below applies to the **group**, not the microbatch. `--moe-n-slots 8` with
+`--ubatch-size 512 --parallel 4` is a valid configuration; before, it could not start.
+
+**The throughput gain from this is modest — measure before relying on it.** On CUDA at full GPU residency,
+32 slots, `pp256`:
+
+| Microbatch | `pp256` | vs the old ceiling | Graph nodes | Splits |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 (the old ceiling) | 36.77 | — | 3,807 | 82 |
+| 64 | 39.29 | +6.9 % | 20,207 | 1,282 |
+| 512 | 40.10 | +9.1 % | 72,047 | 5,122 |
+
+Only about an eighth of the available headroom (fully resident at microbatch 512 reaches 65.46). The reason
+is visible in the last two columns: each group needs its own host-side resolve, which the scheduler turns
+into a pair of graph splits with a device synchronisation, so the split count grows with the number of
+groups and eats most of the batching win. That is also why the gain flattens almost immediately —
+microbatch 64 already captures three quarters of what 512 does.
+
+**So prefer a modest microbatch.** 64 gets most of the benefit for 20k nodes; 512 costs 72k nodes, and at
+roughly 21.5 KB per node — dominated by the scheduler's context buffer, not tensor overhead — that is about
+1.5 GB of host memory against 250 MB. Generation is unaffected either way: one token is one group and takes
+the ungrouped path.
+
+### The saturation point applies to the group, not the microbatch
+
+That bound saturates, and it saturates early. Once `n_expert_used × group` reaches `n_expert`, every expert
+in the layer must be resident and paging buys nothing at all. So paging only has headroom while:
 
 ```
-n_ubatch × n_parallel  <  n_expert / n_expert_used
+group  <  n_expert / n_expert_used        (group = --moe-chunk-size, default n_slots / n_expert_used)
 ```
 
 | Model shape | Paging is useful only below |
 | --- | --- |
-| 128 experts, 8 used (e.g. Qwen3-235B-A22B, Qwen3-30B-A3B) | `n_ubatch × n_parallel` = **16** |
-| 256 experts, 8 used (e.g. Qwen3.6-35B-A3B) | `n_ubatch × n_parallel` = **32** |
+| 128 experts, 8 used (e.g. Qwen3-235B-A22B, Qwen3-30B-A3B) | group = **16** |
+| 256 experts, 8 used (e.g. Qwen3.6-35B-A3B) | group = **32** |
 
-This matters more than the throughput numbers below, because **prefill is what large microbatches are for**.
-A workload with a big system prompt and a lot of injected repository context wants `--ubatch-size` in the
-hundreds; paging forces it into the low tens. Generation is fine — it is inherently one token at a time — but
-prefill is the path that suffers, and no amount of slot tuning fixes it, since raising the slot count to
-allow a larger microbatch is the same as not paging.
+Grouping means this no longer caps the microbatch, but it does still cap how many tokens share an expert
+matmul, and that is what sets prefill efficiency. Raising the slot count far enough to grow the group is the
+same as not paging, so the ceiling is real — grouping moves where it binds, it does not remove it.
 
 If a workload is prefill-heavy, measure prefill first and decide on that, not on generation throughput.
 
