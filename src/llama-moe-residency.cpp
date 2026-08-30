@@ -484,6 +484,84 @@ llama_moe_status llama_moe_reader::start_workers(int32_t n_threads) {
     return LLAMA_MOE_STATUS_OK;
 }
 
+void llama_moe_reader::publish(const llama_moe_read_req * reqs, size_t n) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        cur_reqs = reqs;
+        cur_n    = n;
+
+        next_idx .store(0, std::memory_order_relaxed);
+        n_done   .store(0, std::memory_order_relaxed);
+        first_err.store((int) LLAMA_MOE_STATUS_OK, std::memory_order_relaxed);
+
+        gen++;
+    }
+
+    cv_work.notify_all();
+}
+
+llama_moe_status llama_moe_reader::collect() {
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+
+        cv_done.wait(lock, [this] { return n_done.load(std::memory_order_acquire) >= cur_n; });
+
+        cur_reqs = nullptr;
+        cur_n    = 0;
+    }
+
+    return (llama_moe_status) first_err.load(std::memory_order_relaxed);
+}
+
+llama_moe_status llama_moe_reader::submit(const llama_moe_read_req * reqs, size_t n) {
+    if (n == 0) {
+        return LLAMA_MOE_STATUS_OK;
+    }
+
+    if (reqs == nullptr || pending) {
+        return LLAMA_MOE_STATUS_INVALID_CONFIG;
+    }
+
+    if (stopping.load(std::memory_order_relaxed)) {
+        return LLAMA_MOE_STATUS_CANCELLED;
+    }
+
+    // With no workers nobody would ever service the batch, so there is nothing to defer to - do the reads
+    // here and leave wait() with nothing owed. The caller still gets the same answer, just no overlap.
+    if (workers.empty()) {
+        return read_many(reqs, n);
+    }
+
+    publish(reqs, n);
+
+    pending = true;
+
+    return LLAMA_MOE_STATUS_OK;
+}
+
+llama_moe_status llama_moe_reader::wait() {
+    if (!pending) {
+        return LLAMA_MOE_STATUS_OK;
+    }
+
+    // Only the span the caller actually blocks for counts as read time; whatever overlapped the gate/up
+    // matmuls cost nothing. Timing the whole submit-to-wait window instead would report the read as
+    // expensive as before and hide exactly the effect this exists to produce.
+    const auto t_start = std::chrono::steady_clock::now();
+
+    const llama_moe_status status = collect();
+
+    pending = false;
+
+    st_t_read_us.fetch_add(
+        (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_start).count(),
+        std::memory_order_relaxed);
+
+    return status;
+}
+
 llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, size_t n) {
     if (n == 0) {
         return LLAMA_MOE_STATUS_OK;
@@ -496,6 +574,11 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
     if (stopping.load(std::memory_order_relaxed)) {
         return LLAMA_MOE_STATUS_CANCELLED;
     }
+
+    // Publishing over a batch that is still in flight would leave the workers reading a stale cur_reqs.
+    // The caller is not supposed to get here with one outstanding, but collecting it is the only safe
+    // response - the alternative is a dangling pointer rather than a diagnosable error.
+    wait();
 
     const auto t_start = std::chrono::steady_clock::now();
 
@@ -510,34 +593,12 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
             }
         }
     } else {
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-
-            cur_reqs = reqs;
-            cur_n    = n;
-
-            next_idx .store(0, std::memory_order_relaxed);
-            n_done   .store(0, std::memory_order_relaxed);
-            first_err.store((int) LLAMA_MOE_STATUS_OK, std::memory_order_relaxed);
-
-            gen++;
-        }
-
-        cv_work.notify_all();
+        publish(reqs, n);
 
         // the caller is a worker too, so the batch still completes even if every worker has exited
         drain(reqs, n);
 
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-
-            cv_done.wait(lock, [this] { return n_done.load(std::memory_order_acquire) >= cur_n; });
-
-            cur_reqs = nullptr;
-            cur_n    = 0;
-        }
-
-        status = (llama_moe_status) first_err.load(std::memory_order_relaxed);
+        status = collect();
     }
 
     const auto t_end = std::chrono::steady_clock::now();
@@ -550,6 +611,12 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
 }
 
 void llama_moe_reader::shutdown() {
+    // A submitted batch points at caller memory and is being written by the workers. Joining them without
+    // collecting it first would leave cur_reqs dangling and the destinations half-written; drain it while
+    // the workers are still alive. drain() turns every remaining request into CANCELLED once stopping is
+    // set, so this cannot block on I/O that will never finish.
+    wait();
+
     if (workers.empty()) {
         stopping.store(true, std::memory_order_relaxed);
         return;

@@ -181,6 +181,20 @@ struct llama_moe_reader {
     // in the batch, so it completes even if no workers were started.
     llama_moe_status read_many(const llama_moe_read_req * reqs, size_t n);
 
+    // Hand a batch to the workers and return without waiting, so the caller can do other work while it runs.
+    // reqs must stay alive and unmodified until wait() returns.
+    //
+    // Still one batch at a time: there must be no batch in flight, and the next read_many() or submit() has
+    // to be preceded by wait(). With no worker threads there is nobody to service it, so the reads happen on
+    // the calling thread here and wait() has nothing left to do.
+    llama_moe_status submit(const llama_moe_read_req * reqs, size_t n);
+
+    // Wait for the batch submitted by submit() and return its first error. No-op when nothing is in flight.
+    llama_moe_status wait();
+
+    // true if a submitted batch has not been waited for yet
+    bool in_flight() const { return pending; }
+
     // Start n_threads workers. 0 or 1 keeps everything on the calling thread.
     llama_moe_status start_workers(int32_t n_threads);
 
@@ -217,6 +231,12 @@ private:
     const llama_moe_read_req * cur_reqs = nullptr;
     size_t                     cur_n    = 0;
     uint64_t                   gen      = 0;  // bumped per batch so workers can tell batches apart
+    bool                       pending  = false;  // a submit() is outstanding and wait() still owes it
+
+    // shared by read_many() and submit(): publish the batch and wake the workers
+    void publish(const llama_moe_read_req * reqs, size_t n);
+    // shared by read_many() and wait(): block until the published batch is done, then clear it
+    llama_moe_status collect();
 
     std::atomic<size_t>   next_idx {0};
     std::atomic<size_t>   n_done   {0};
