@@ -85,8 +85,10 @@ Size `25092531712`, SHA-256 `0c1754eaf4514d9cb6aaf1a6a2c15cd496d56b8413843b2ea93
 
 Verify the hash before trusting any numbers from it.
 
-This model uses 8 experts per token, so **8 slots requires `--ubatch-size 1`**. At a larger microbatch the
-configuration check will refuse it and tell you the slot count it needs.
+This model uses 8 experts per token, so `--moe-n-slots 8` gives a group of 1 token. The microbatch is **not**
+constrained by that — the expert path is split into groups that fit the pool — so `--ubatch-size` is free.
+Earlier revisions of this branch did refuse large microbatches; if you are working from older notes, that is
+no longer the behaviour.
 
 ### 4a. Deterministic equivalence
 
@@ -114,6 +116,9 @@ done
   -ngl 99 -p 32 -n 16 -r 3 -ub 1 -b 8 --moe-n-slots <0|8|16|32>
 ```
 
+Also worth one run at `-ub 64` with the same slot count, now that grouping allows it. On CUDA that was worth
+about +7 % prefill; whether Metal behaves the same is unknown and is a genuinely useful data point.
+
 Record for each slot count:
 
 | Slots | Peak footprint | Metal allocation | tg t/s | pp t/s | Hit rate | Bytes read | Read time | Swap |
@@ -139,8 +144,10 @@ large unrelated file to evict it, and confirm with `fs_usage` or `iostat` that r
 ## 5. Failure and lifecycle
 
 - [ ] `--moe-n-slots 4` with 8 experts per token is refused before inference with a message naming the
-      required count, not an abort
-- [ ] `--moe-n-slots 8 --ubatch-size 4` is refused, naming 32 as the needed count
+      required count, not an abort (a single token needs 8 slots, so no group size can help)
+- [ ] `--moe-n-slots 8 --ubatch-size 512 --parallel 4` **starts and runs correctly** (it was refused before
+      token grouping; the group, not the microbatch, is what the pool bounds)
+- [ ] `--moe-chunk-size 99` with `--moe-n-slots 32` is refused, naming the slots it would need
 - [ ] `--moe-n-slots 8 --n-cpu-moe 4` is refused as a conflict
 - [ ] truncating or replacing the model file mid-run surfaces a propagated error, not a crash
 - [ ] `llama-cli` exits cleanly with no orphan processes
