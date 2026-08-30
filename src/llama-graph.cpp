@@ -1997,7 +1997,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in) const {
-    const int64_t n_embd   = cur->ne[0];
+    // n_embd is only needed by the expert half, which now derives it from its own sliced input
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
@@ -2198,6 +2198,60 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Everything except the pooled matmuls keeps indexing by expert id: the routing weights, the
     // per-expert biases and the per-expert scales are all fully resident and sized by n_expert.
     ggml_tensor * mm_ids = slot_ids != nullptr ? slot_ids : selected_experts;
+
+    const moe_expert_args margs = {
+        /*.cur              =*/ cur,
+        /*.mm_ids           =*/ mm_ids,
+        /*.selected_experts =*/ selected_experts,
+        /*.weights          =*/ weights,
+        /*.gate_up_exps     =*/ gate_up_exps,
+        /*.gate_up_exps_b   =*/ gate_up_exps_b,
+        /*.up_exps          =*/ up_exps,
+        /*.up_exps_b        =*/ up_exps_b,
+        /*.gate_exps        =*/ gate_exps,
+        /*.gate_exps_b      =*/ gate_exps_b,
+        /*.down_exps        =*/ down_exps,
+        /*.down_exps_b      =*/ down_exps_b,
+        /*.up_exps_s        =*/ up_exps_s,
+        /*.gate_exps_s      =*/ gate_exps_s,
+        /*.down_exps_s      =*/ down_exps_s,
+        /*.n_expert_used    =*/ n_expert_used,
+        /*.type_op          =*/ type_op,
+        /*.weight_before_ffn=*/ weight_before_ffn,
+        /*.il               =*/ il,
+    };
+
+    return build_moe_experts(margs);
+}
+
+ggml_tensor * llm_graph_context::build_moe_experts(const moe_expert_args & args) const {
+    ggml_tensor * cur              = args.cur;
+    ggml_tensor * mm_ids           = args.mm_ids;
+    ggml_tensor * selected_experts = args.selected_experts;
+    ggml_tensor * weights          = args.weights;
+
+    ggml_tensor * gate_up_exps   = args.gate_up_exps;
+    ggml_tensor * gate_up_exps_b = args.gate_up_exps_b;
+    ggml_tensor * up_exps        = args.up_exps;
+    ggml_tensor * up_exps_b      = args.up_exps_b;
+    ggml_tensor * gate_exps      = args.gate_exps;
+    ggml_tensor * gate_exps_b    = args.gate_exps_b;
+    ggml_tensor * down_exps      = args.down_exps;
+    ggml_tensor * down_exps_b    = args.down_exps_b;
+    ggml_tensor * up_exps_s      = args.up_exps_s;
+    ggml_tensor * gate_exps_s    = args.gate_exps_s;
+    ggml_tensor * down_exps_s    = args.down_exps_s;
+
+    const int64_t n_expert_used = args.n_expert_used;
+
+    const llm_ffn_op_type type_op = args.type_op;
+
+    const bool weight_before_ffn = args.weight_before_ffn;
+
+    const int il = args.il;
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2400,6 +2454,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     return moe_out;
 }
+
 
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {

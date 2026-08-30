@@ -1106,6 +1106,39 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // Inputs to the per-token expert computation, bundled so the same code can be run over a slice of the
+    // microbatch. Every field is either shared by all tokens (the expert weights) or already sliced by the
+    // caller (cur, the id tensors, weights).
+    struct moe_expert_args {
+        ggml_tensor * cur;              // [n_embd, n_tokens]
+        ggml_tensor * mm_ids;           // ids for the pooled weight lookup - slots when paging, experts otherwise
+        ggml_tensor * selected_experts; // ids for everything still sized by n_expert: biases, scales, LoRA
+        ggml_tensor * weights;
+
+        ggml_tensor * gate_up_exps;
+        ggml_tensor * gate_up_exps_b;
+        ggml_tensor * up_exps;
+        ggml_tensor * up_exps_b;
+        ggml_tensor * gate_exps;
+        ggml_tensor * gate_exps_b;
+        ggml_tensor * down_exps;
+        ggml_tensor * down_exps_b;
+        ggml_tensor * up_exps_s;
+        ggml_tensor * gate_exps_s;
+        ggml_tensor * down_exps_s;
+
+        int64_t n_expert_used;
+
+        llm_ffn_op_type type_op;
+
+        bool weight_before_ffn;
+
+        int il;
+    };
+
+    // the expert half of build_moe_ffn: everything after routing, for the tokens in args.cur
+    ggml_tensor * build_moe_experts(const moe_expert_args & args) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
