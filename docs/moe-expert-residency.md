@@ -198,16 +198,25 @@ as simply running a global microbatch of C — the expert matmul sees C tokens e
 actually buys is letting *attention and the dense path* run at the full microbatch. So the gain is bounded by
 how much those layers care about batch size, not by how much the MoE layer does.
 
-Measured upper bound on CPU, Qwen3.6-35B-A3B with paging off, `pp256`: microbatch 4 gives 21.93 tok/s and
-microbatch 512 gives 26.39, i.e. a 128x larger microbatch is worth **20 %** across the *whole* model.
-Chunking can only capture the attention/dense share of that, so on CPU it is not worth refactoring a
-427-line, 41-branch function that every MoE model traverses.
+**On CPU it is not worth it; on GPU it is.** Qwen3.6-35B-A3B, `pp256`, paging off: raising the microbatch
+from 4 to 512 is worth **+20 %** on CPU (21.93 → 26.39) but **+141 %** on CUDA (27.12 → 65.46). Prefill on a
+GPU is far more batch-sensitive, and the GPU is where a model this size actually runs.
 
-GPUs are far more batch-sensitive than CPUs, so this bound may not carry over — and the GPU case is the one
-that matters, since that is where a large model would actually run. Measure prefill against microbatch on the
-target accelerator before deciding. A useful signal that prefill is being crippled: on Metal at microbatch 1,
-`pp` and `tg` were 7.29 and 6.18 tok/s, barely apart, where a healthy configuration has prefill several times
-generation.
+The isolated measurement is the convincing one. Holding the slot count fixed at 32 — so the residency policy
+is *identical*, hit rate 73.21/73.22/73.23 % and bytes read within 0.04 % — and varying only the microbatch,
+full GPU residency:
+
+| Microbatch | `pp256` | vs microbatch 1 |
+| ---: | ---: | ---: |
+| 1 | 26.95 | — |
+| 2 | 32.20 | +19.5 % |
+| 4 | 36.67 | +36.1 % |
+
+Same reads, same evictions, **+36 % prefill purely from batching**, and 4 is as far as 32 slots allow. That
+is exactly the ceiling chunking would lift, and the no-paging figures above show substantial headroom past 4.
+
+A useful signal that prefill is being crippled: on Metal at microbatch 1, `pp` and `tg` were 7.29 and 6.18
+tok/s, barely apart, where a healthy configuration has prefill several times generation.
 
 Also note the trade: smaller groups amortise each expert read across fewer tokens, and a group boundary can
 evict what the next group needs, so bytes read would rise.
