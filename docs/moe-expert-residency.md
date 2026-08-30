@@ -192,9 +192,25 @@ matmul once per sub-group is mathematically identical. That would decouple the s
 microbatch, letting attention and the dense path run at `--ubatch-size 512` while the MoE layer internally
 works in groups of, say, 8 — turning the saturation limit above from a hard wall into a tunable.
 
-It is the only idea here that addresses the prefill problem rather than the read cost. The trade is real
-though: smaller groups amortise each expert read across fewer tokens, and a group boundary can evict what the
-next group needs, so bytes read would rise. Worth prototyping and measuring before believing.
+It is the only idea here that addresses the prefill problem rather than the read cost, but **its ceiling is
+lower than it first appears**. Chunking to groups of C gives the MoE path exactly the same read amortisation
+as simply running a global microbatch of C — the expert matmul sees C tokens either way. The only thing it
+actually buys is letting *attention and the dense path* run at the full microbatch. So the gain is bounded by
+how much those layers care about batch size, not by how much the MoE layer does.
+
+Measured upper bound on CPU, Qwen3.6-35B-A3B with paging off, `pp256`: microbatch 4 gives 21.93 tok/s and
+microbatch 512 gives 26.39, i.e. a 128x larger microbatch is worth **20 %** across the *whole* model.
+Chunking can only capture the attention/dense share of that, so on CPU it is not worth refactoring a
+427-line, 41-branch function that every MoE model traverses.
+
+GPUs are far more batch-sensitive than CPUs, so this bound may not carry over — and the GPU case is the one
+that matters, since that is where a large model would actually run. Measure prefill against microbatch on the
+target accelerator before deciding. A useful signal that prefill is being crippled: on Metal at microbatch 1,
+`pp` and `tg` were 7.29 and 6.18 tok/s, barely apart, where a healthy configuration has prefill several times
+generation.
+
+Also note the trade: smaller groups amortise each expert read across fewer tokens, and a group boundary can
+evict what the next group needs, so bytes read would rise.
 
 **Candidate: read fewer bytes.** At 32 slots over 128 cold tokens the hit rate is 72.2 %, so there is
 headroom, and every avoided miss is ~400 KiB not read. Options: pin a per-layer hot set that is never
