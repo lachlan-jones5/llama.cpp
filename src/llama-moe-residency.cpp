@@ -726,6 +726,8 @@ llama_moe_status llama_moe_residency::init(
         chunk = 1;
     }
 
+    overlap = params.overlap_reads;
+
     // an explicit override may ask for more than the slots can hold
     if ((int64_t) n_expert_used * chunk > n_slots) {
         return LLAMA_MOE_STATUS_INVALID_CONFIG;

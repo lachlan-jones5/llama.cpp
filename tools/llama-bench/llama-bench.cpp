@@ -355,6 +355,7 @@ struct cmd_params {
     int32_t                          moe_n_slots  = 0; // applies to every run, not an axis of the sweep
     int32_t                          moe_n_layers = 0;
     int32_t                          moe_chunk_size = 0;
+    bool                             moe_overlap_reads = false;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* moe_n_slots          */ 0,
     /* moe_n_layers         */ 0,
     /* moe_chunk_size       */ 0,
+    /* moe_overlap_reads    */ false,
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -478,6 +480,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --moe-n-slots <n>                                 (default: %d, 0 = expert paging disabled)\n", cmd_params_defaults.moe_n_slots);
     printf("  --moe-n-layers <n>                                (default: %d, 0 = all MoE layers)\n", cmd_params_defaults.moe_n_layers);
     printf("  --moe-chunk-size <n>                              (default: %d, 0 = derive from slots)\n", cmd_params_defaults.moe_chunk_size);
+    printf("  --moe-overlap-reads                               (default: %s, keep the down read in flight)\n", cmd_params_defaults.moe_overlap_reads ? "on" : "off");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -757,6 +760,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.moe_chunk_size = std::stoi(argv[i]);
+            } else if (arg == "--moe-overlap-reads") {
+                params.moe_overlap_reads = true;
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1276,6 +1281,7 @@ struct cmd_params_instance {
     int32_t            moe_n_slots;
     int32_t            moe_n_layers;
     int32_t            moe_chunk_size;
+    bool               moe_overlap_reads;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1307,6 +1313,7 @@ struct cmd_params_instance {
         mparams.moe.n_slots   = moe_n_slots;
         mparams.moe.n_layers  = moe_n_layers;
         mparams.moe.n_chunk_size = moe_chunk_size;
+        mparams.moe.overlap_reads = moe_overlap_reads;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1427,6 +1434,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_n_slots           = */ params.moe_n_slots,
                 /* .moe_n_layers          = */ params.moe_n_layers,
                 /* .moe_chunk_size        = */ params.moe_chunk_size,
+                /* .moe_overlap_reads     = */ params.moe_overlap_reads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1467,6 +1475,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_n_slots           = */ params.moe_n_slots,
                 /* .moe_n_layers          = */ params.moe_n_layers,
                 /* .moe_chunk_size        = */ params.moe_chunk_size,
+                /* .moe_overlap_reads     = */ params.moe_overlap_reads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1507,6 +1516,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_n_slots           = */ params.moe_n_slots,
                 /* .moe_n_layers          = */ params.moe_n_layers,
                 /* .moe_chunk_size        = */ params.moe_chunk_size,
+                /* .moe_overlap_reads     = */ params.moe_overlap_reads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,

@@ -352,6 +352,9 @@ struct llama_moe_residency {
 
     int32_t slots() const { return n_slots; }
 
+    // true when the down-projection read should be left in flight across the gate/up matmuls
+    bool overlap_reads() const { return overlap; }
+
     // Bytes the slot pools occupy, keyed by the buffer type each was allocated on. Pools are created during
     // graph building, so this is empty until a graph has been built - but the reserve pass in the context
     // constructor builds one, so it is populated by the time anything asks.
@@ -369,6 +372,7 @@ private:
 
     int32_t n_slots = 0;
     int32_t chunk   = 1;
+    bool    overlap = false;
 
     // indexed by layer; layers that are not paged are left empty
     std::vector<llama_moe_layer> layers;

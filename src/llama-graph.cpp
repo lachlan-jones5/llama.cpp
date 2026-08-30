@@ -2191,8 +2191,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps      = bind(up_exps);
         gate_exps    = bind(gate_exps);
         // The down projection is the one weight the FFN does not need immediately - it consumes the gate/up
-        // activation - so its read is left in flight and collected just before the matmul that uses it.
-        down_exps    = bind(down_exps, /*deferred =*/ true);
+        // activation - so its read can be left in flight and collected just before the matmul that uses it.
+        // Off unless asked for: the collecting node costs two graph splits per layer, which on CUDA is a
+        // clear loss. See llama_moe_params::overlap_reads.
+        down_exps    = bind(down_exps, /*deferred =*/ moe_res->overlap_reads());
 
         // The pools hold n_slots experts, not n_expert, so the matmuls below must be indexed by slot.
         rc = moe_res->resolve_ctx(il);
@@ -2239,7 +2241,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.n_expert_used    =*/ n_expert_used,
         /*.type_op          =*/ type_op,
         /*.weight_before_ffn=*/ weight_before_ffn,
-        /*.moe_rc           =*/ rc,
+        /*.moe_rc           =*/ moe_res != nullptr && moe_res->overlap_reads() ? rc : nullptr,
         /*.il               =*/ il,
     };
 

@@ -323,6 +323,13 @@ extern "C" {
         // Tokens per expert-matmul group. Every expert a group routes to must be resident at once, so this
         // is what the slot count actually bounds - not the microbatch. 0 derives it as n_slots/n_expert_used.
         int32_t n_chunk_size;
+
+        // Leave the down-projection read in flight across the gate/up matmuls instead of waiting for it up
+        // front. Off by default: collecting it needs a host-side node between two device matmuls, which
+        // costs two graph splits per paged layer, and on CUDA that is worse than what the overlap saves
+        // (-17 % prefill, -11 % generation, 82 splits to 162). It only has a chance of paying where reads
+        // are a large share of wall time, so it is exposed to be measured rather than assumed.
+        bool overlap_reads;
     };
 
     struct llama_model_params {
