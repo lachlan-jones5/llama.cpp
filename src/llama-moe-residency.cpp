@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #if defined(_WIN32)
@@ -15,6 +16,46 @@
 #   include <cerrno>
 #   include <unistd.h>
 #endif
+
+// Optional routing trace, enabled with LLAMA_MOE_TRACE=<path>. One line per resolve:
+//
+//   <layer> <n> <id> <id> ...
+//
+// It records what the router asked for, which is a property of the model and the prompt alone - the slot
+// count and the admission policy do not affect it. So one capture can be replayed offline against any pool
+// size or policy, which is the point: it makes "would a different policy read fewer bytes?" answerable
+// without a rebuild-and-benchmark cycle per candidate.
+static FILE * moe_trace_file() {
+    static FILE * f = [] () -> FILE * {
+        const char * path = getenv("LLAMA_MOE_TRACE");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        FILE * out = fopen(path, "w");
+        if (out == nullptr) {
+            fprintf(stderr, "%s: could not open '%s' for the expert routing trace\n", __func__, path);
+        }
+        return out;
+    }();
+    return f;
+}
+
+static void moe_trace_resolve(int32_t il, const int32_t * ids, int32_t n) {
+    FILE * f = moe_trace_file();
+    if (f == nullptr) {
+        return;
+    }
+
+    // resolve() may be reached from more than one graph thread; keep whole lines intact
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    fprintf(f, "%d %d", il, n);
+    for (int32_t i = 0; i < n; ++i) {
+        fprintf(f, " %d", ids[i]);
+    }
+    fputc('\n', f);
+}
 
 const char * llama_moe_status_str(llama_moe_status status) {
     switch (status) {
@@ -738,6 +779,8 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
     }
 
     auto & layer = layers[(size_t) il];
+
+    moe_trace_resolve(il, ids, n);
 
     // decide which experts go where; no I/O yet
     const llama_moe_status status = layer.cache.resolve(ids, n, out_slots, fills);

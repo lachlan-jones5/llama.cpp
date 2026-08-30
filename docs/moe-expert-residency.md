@@ -180,7 +180,7 @@ them. Making paging materially faster means reading *less* (a higher hit rate) o
 
 ### Optimisations considered, with their measured basis
 
-Recorded so the analysis does not have to be redone. None of these are implemented.
+Recorded so the analysis does not have to be redone. Each is marked done, rejected or still open.
 
 **Rejected: a device-side handshake.** Replace the host refill node with an in-place device stall — a kernel
 publishes the routed ids to shared memory, the device stalls on an event (`MTLSharedEvent` on Metal,
@@ -209,7 +209,10 @@ the gate/up matmuls have run, so the refill could be split: fill gate/up, let co
 concurrently. That hides roughly a third of the read stall, needs no device stall, and leaves the admission
 policy and the correctness tests untouched. This is the most promising of the three.
 
-**Candidate: chunk the microbatch inside the MoE layer.** The slot bound exists because one
+**Done: chunk the microbatch inside the MoE layer** — shipped as token groups; see *Token groups* above for
+what it delivered (**+9.1 %** prefill at microbatch 512, +6.9 % at 64, against the old ceiling of 4). The
+analysis below is kept because it predicted the outcome correctly, including the modest size of it. The slot
+bound existed because one
 `mul_mat_id` consumes every token in the ubatch at once, so every expert any of them routed to has to be
 resident together. But the MoE FFN is per-token: splitting the ubatch into sub-groups and running the expert
 matmul once per sub-group is mathematically identical. That would decouple the slot count from the global
@@ -280,6 +283,16 @@ every paged layer. Tools that print a performance summary print these alongside 
 
 A low hit rate means the slot count is too small for the routing pattern: either raise it, or accept that the
 model's routing is too diffuse for paging to help.
+
+### Routing traces
+
+`LLAMA_MOE_TRACE=<path>` writes one line per resolve — `<layer> <n> <id> <id> ...` — recording what the
+router asked for. Routing depends only on the model and the input, not on the slot count or the admission
+policy, so a single capture can be replayed offline against any pool size or candidate policy. That makes
+"would a different policy read fewer bytes?" answerable without a rebuild-and-benchmark cycle per candidate,
+and a replay of the current policy can be checked against the counters the run itself reports.
+
+Tracing is off unless the variable is set, and costs one null check per resolve when it is.
 
 ## Testing
 
