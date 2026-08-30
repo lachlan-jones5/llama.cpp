@@ -1897,6 +1897,12 @@ llama_split_mode llama_model::split_mode() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (bufs.empty()) {
+            // paged expert weights are metadata only - their storage is the residency pools, which belong
+            // to the context, not the model. Nothing to account for here, and no buffer to ask about.
+            continue;
+        }
+
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
