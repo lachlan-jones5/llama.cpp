@@ -86,7 +86,7 @@ struct llama_model_loader {
 
     // set by the caller before the create_tensor() calls
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_OFF;
-    llama_moe_params     moe       = { 0, 0, 0 };
+    llama_moe_params     moe       = { 0, 0, 0, 0 };
 
     llama_files files;
     llama_ftype ftype;

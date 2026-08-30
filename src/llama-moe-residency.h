@@ -267,7 +267,8 @@ struct llama_moe_resolve_ctx {
 // staging through pinned host memory) that is the job of a backend adapter, looked up at runtime.
 struct llama_moe_residency {
     llama_moe_status init(const llama_moe_params & params,
-                          const std::unordered_map<std::string, llama_moe_tensor_info> & paged);
+                          const std::unordered_map<std::string, llama_moe_tensor_info> & paged,
+                          int32_t n_expert_used);
 
     // register the model file(s) the experts are read from
     llama_moe_status add_file(int fd, uint64_t size, size_t * idx);
@@ -309,10 +310,15 @@ struct llama_moe_residency {
 
     int32_t slots() const { return n_slots; }
 
+    // Tokens per expert-matmul group. Every expert a group routes to must be resident at once, so this -
+    // not the microbatch - is what the slot count bounds.
+    int32_t chunk_size() const { return chunk; }
+
 private:
     void latch(llama_moe_status status, std::string detail);
 
     int32_t n_slots = 0;
+    int32_t chunk   = 1;
 
     // indexed by layer; layers that are not paged are left empty
     std::vector<llama_moe_layer> layers;

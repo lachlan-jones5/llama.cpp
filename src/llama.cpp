@@ -356,6 +356,17 @@ static void llama_moe_validate_params(const llama_model_params & params, const l
             moe.n_slots, n_expert_used));
     }
 
+    // an explicit chunk override has to fit the pool: every expert the group routes to must be resident
+    if (moe.n_chunk_size > 0) {
+        const int64_t needed = (int64_t) n_expert_used * moe.n_chunk_size;
+
+        if (needed > moe.n_slots) {
+            throw std::runtime_error(format(
+                "--moe-chunk-size (%d) needs %lld slots at %u experts per token, but --moe-n-slots is %d",
+                moe.n_chunk_size, (long long) needed, n_expert_used, moe.n_slots));
+        }
+    }
+
     if (moe.n_layers > 0 && (uint32_t) moe.n_layers > hparams.n_layer_all) {
         throw std::runtime_error(format(
             "--moe-n-layers (%d) exceeds the %u layers of this model",
@@ -388,9 +399,13 @@ static void llama_moe_validate_params(const llama_model_params & params, const l
         }
     }
 
-    LLAMA_LOG_INFO("%s: MoE expert paging enabled: %d of %u experts resident per layer, %s layers\n",
+    const int32_t chunk = moe.n_chunk_size > 0 ? moe.n_chunk_size : std::max(1, moe.n_slots / (int32_t) n_expert_used);
+
+    LLAMA_LOG_INFO("%s: MoE expert paging enabled: %d of %u experts resident per layer, %s layers, "
+            "%d token%s per expert group\n",
             __func__, moe.n_slots, n_expert,
-            moe.n_layers > 0 ? format("first %d", moe.n_layers).c_str() : "all MoE");
+            moe.n_layers > 0 ? format("first %d", moe.n_layers).c_str() : "all MoE",
+            chunk, chunk == 1 ? "" : "s");
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback

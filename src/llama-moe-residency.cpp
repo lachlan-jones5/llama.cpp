@@ -580,13 +580,31 @@ void llama_moe_residency::latch(llama_moe_status status, std::string detail) {
 
 llama_moe_status llama_moe_residency::init(
         const llama_moe_params & params,
-        const std::unordered_map<std::string, llama_moe_tensor_info> & paged) {
+        const std::unordered_map<std::string, llama_moe_tensor_info> & paged,
+        int32_t n_expert_used) {
     if (params.n_slots <= 0 || paged.empty()) {
         return LLAMA_MOE_STATUS_OK; // paging is off, or the model had nothing to page
     }
 
+    if (n_expert_used <= 0) {
+        return LLAMA_MOE_STATUS_INVALID_CONFIG;
+    }
+
     n_slots    = params.n_slots;
     paged_info = paged;
+
+    // How many tokens can share one expert matmul: every expert the group routes to has to be resident at
+    // the same time, so the slot count divided by the experts each token uses is the most that fits.
+    chunk = params.n_chunk_size > 0 ? params.n_chunk_size : n_slots / n_expert_used;
+
+    if (chunk < 1) {
+        chunk = 1;
+    }
+
+    // an explicit override may ask for more than the slots can hold
+    if ((int64_t) n_expert_used * chunk > n_slots) {
+        return LLAMA_MOE_STATUS_INVALID_CONFIG;
+    }
 
     int32_t n_layer_max = 0;
     for (const auto & [_, info] : paged) {

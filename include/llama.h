@@ -319,6 +319,10 @@ extern "C" {
         int32_t n_slots;        // resident expert slots per paged layer (0 disables expert paging)
         int32_t n_layers;       // number of leading MoE layers to page (0 = every MoE layer)
         int32_t n_read_threads; // threads used to read experts (0 = pick a default)
+
+        // Tokens per expert-matmul group. Every expert a group routes to must be resident at once, so this
+        // is what the slot count actually bounds - not the microbatch. 0 derives it as n_slots/n_expert_used.
+        int32_t n_chunk_size;
     };
 
     struct llama_model_params {

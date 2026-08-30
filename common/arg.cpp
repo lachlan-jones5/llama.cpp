@@ -2829,6 +2829,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_N_LAYERS"));
     add_opt(common_arg(
+        {"--moe-chunk-size"}, "N",
+        "tokens per expert-matmul group when using --moe-n-slots (default: 0, derive as n_slots/n_expert_used)\n"
+        "every expert a group routes to must be resident at once, so this is what the slot count bounds",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe.n_chunk_size = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CHUNK_SIZE"));
+    add_opt(common_arg(
         {"--moe-read-threads"}, "N",
         "threads used to read experts for --moe-n-slots (default: 0, pick a default)",
         [](common_params & params, int value) {

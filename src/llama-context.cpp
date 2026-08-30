@@ -388,7 +388,8 @@ llama_context::llama_context(
         if (model.moe_params().n_slots > 0 && !model.moe_paged.empty()) {
             moe_res = std::make_unique<llama_moe_residency>();
 
-            llama_moe_status status = moe_res->init(model.moe_params(), model.moe_paged);
+            llama_moe_status status = moe_res->init(model.moe_params(), model.moe_paged,
+                    (int32_t) model.hparams.n_expert_used);
 
             for (size_t i = 0; i < model.moe_files.size() && status == LLAMA_MOE_STATUS_OK; i++) {
                 size_t idx = 0;
