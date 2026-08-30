@@ -39,6 +39,29 @@ sequences**. For a model using 8 experts per token, `--moe-n-slots 8` requires `
 `--parallel 1`; the same model with `--parallel 4` needs 32 slots, and at the default `--ubatch-size 512` it
 needs 256 slots, which is most of the layer and defeats the purpose.
 
+### The saturation point — paging and large-microbatch prefill are incompatible
+
+That bound saturates, and it saturates early. Once `n_expert_used × n_ubatch × n_parallel` reaches
+`n_expert`, every expert in the layer must be resident and paging buys nothing at all. So paging only has
+headroom while:
+
+```
+n_ubatch × n_parallel  <  n_expert / n_expert_used
+```
+
+| Model shape | Paging is useful only below |
+| --- | --- |
+| 128 experts, 8 used (e.g. Qwen3-235B-A22B, Qwen3-30B-A3B) | `n_ubatch × n_parallel` = **16** |
+| 256 experts, 8 used (e.g. Qwen3.6-35B-A3B) | `n_ubatch × n_parallel` = **32** |
+
+This matters more than the throughput numbers below, because **prefill is what large microbatches are for**.
+A workload with a big system prompt and a lot of injected repository context wants `--ubatch-size` in the
+hundreds; paging forces it into the low tens. Generation is fine — it is inherently one token at a time — but
+prefill is the path that suffers, and no amount of slot tuning fixes it, since raising the slot count to
+allow a larger microbatch is the same as not paging.
+
+If a workload is prefill-heavy, measure prefill first and decide on that, not on generation throughput.
+
 Larger slot counts raise the hit rate and cost more memory. The hit rate is reported at the end of a run.
 
 ## What it costs
@@ -161,6 +184,17 @@ the gate, up and down pools together and everything waits. The down projection i
 the gate/up matmuls have run, so the refill could be split: fill gate/up, let compute proceed, and fetch down
 concurrently. That hides roughly a third of the read stall, needs no device stall, and leaves the admission
 policy and the correctness tests untouched. This is the most promising of the three.
+
+**Candidate: chunk the microbatch inside the MoE layer.** The slot bound exists because one
+`mul_mat_id` consumes every token in the ubatch at once, so every expert any of them routed to has to be
+resident together. But the MoE FFN is per-token: splitting the ubatch into sub-groups and running the expert
+matmul once per sub-group is mathematically identical. That would decouple the slot count from the global
+microbatch, letting attention and the dense path run at `--ubatch-size 512` while the MoE layer internally
+works in groups of, say, 8 — turning the saturation limit above from a hard wall into a tunable.
+
+It is the only idea here that addresses the prefill problem rather than the read cost. The trade is real
+though: smaller groups amortise each expert read across fewer tokens, and a group boundary can evict what the
+next group needs, so bytes read would rise. Worth prototyping and measuring before believing.
 
 **Candidate: read fewer bytes.** At 32 slots over 128 cold tokens the hit rate is 72.2 %, so there is
 headroom, and every avoided miss is ~400 KiB not read. Options: pin a per-layer hot set that is never
