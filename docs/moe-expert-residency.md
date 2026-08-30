@@ -131,6 +131,37 @@ What is left is the disk reads themselves, which are inherently serialised again
 them. Making paging materially faster means reading *less* (a higher hit rate) or reading *earlier*
 (overlapping a layer's reads with compute that does not depend on them) — not removing graph splits.
 
+### Optimisations considered, with their measured basis
+
+Recorded so the analysis does not have to be redone. None of these are implemented.
+
+**Rejected: a device-side handshake.** Replace the host refill node with an in-place device stall — a kernel
+publishes the routed ids to shared memory, the device stalls on an event (`MTLSharedEvent` on Metal,
+`cuStreamWaitValue32` on CUDA), and a CPU sidecar reads the experts and releases it. This is what the original
+proof of concept did. It was measured and rejected: it removes the round trip but **not the wait**, since the
+device still stalls for the duration of the reads. It targets the ~1 % above while the real gap is ~26 %, and
+it costs a documented deadlock risk — NVIDIA's own documentation warns "improper use of this API may deadlock
+the application". Worth revisiting only if the split cost is ever shown to matter on a given machine.
+
+*Caveat if it is revisited:* on Apple unified memory `-ngl 99` with paging **is** full GPU residency, which is
+the one configuration where splits do grow (+2 per paged layer, ~96 for a 48-layer model). Measure there
+before assuming the CUDA result carries over.
+
+**Candidate: overlap a layer's reads with compute that does not depend on them.** Today one refill fetches
+the gate, up and down pools together and everything waits. The down projection is not consumed until after
+the gate/up matmuls have run, so the refill could be split: fill gate/up, let compute proceed, and fetch down
+concurrently. That hides roughly a third of the read stall, needs no device stall, and leaves the admission
+policy and the correctness tests untouched. This is the most promising of the three.
+
+**Candidate: read fewer bytes.** At 32 slots over 128 cold tokens the hit rate is 72.2 %, so there is
+headroom, and every avoided miss is ~400 KiB not read. Options: pin a per-layer hot set that is never
+evicted, refuse admission to experts routed only once in a ubatch, or carry residency across the requests of
+one conversation. Payoff is uncertain — the routing may simply be too diffuse.
+
+**Not a lever: read concurrency.** Already measured — 4, 16 and 32 read threads give identical cold
+bandwidth, because queue depth is bounded by the number of misses in a layer, not by the number of threads.
+Raising `--moe-read-threads` will not help.
+
 ## How it works
 
 Expert weight matrices for paged layers are given metadata but no storage - no buffer is allocated for them
