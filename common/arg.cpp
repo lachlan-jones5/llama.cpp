@@ -2810,7 +2810,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-n-slots"}, "N",
         "keep only N experts of each paged MoE layer resident, reading the rest from the model file on demand (default: 0, disabled)\n"
         "trades throughput for memory, so it only helps when the model does not fit but its working set does\n"
-        "N must be at least n_expert_used * n_ubatch",
+        "N must be at least n_expert_used: the expert path runs in groups of N/n_expert_used tokens, so the\n"
+        "microbatch is not what N bounds, but a very small N with a large --ubatch-size needs one group per\n"
+        "token and can exceed the graph node budget",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

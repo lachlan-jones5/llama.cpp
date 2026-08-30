@@ -17,9 +17,15 @@ only negative was the already-scoped upstream non-embedded BF16 metallib defect.
 
 Measurements from that run are recorded in `moe-expert-residency.md`; do not re-derive them here.
 
-**Two things changed after that run and are therefore unvalidated on Metal:** slot pools are now counted in
-the memory breakdown, and the fit pass no longer aborts when paging is on. Re-run sections 1, 2 and 5 when
-the next tip is sent, and note that `--fit off` is no longer required.
+**Also passed at tip `2c0fadf58`**, covering everything that changed after the run above: the fit pass no
+longer aborts with paging on (natural runs with neither `-ngl` nor `--fit off` succeed), the slot pools are
+charged to the fitter (MTL0 model 2418 MiB at 8 slots against 6670 at 32), the graph-budget refusal names an
+exact microbatch, and eviction by frequency left every output byte-identical. Measurements from both runs are
+recorded in `moe-expert-residency.md`.
+
+**Unvalidated on Metal as of the next tip:** `--moe-overlap-reads`, which is off by default because it is a
+clear loss on CUDA. Metal is the one backend where it might pay, so it needs an A/B rather than an
+assumption.
 
 ## What to expect
 
@@ -160,8 +166,11 @@ large unrelated file to evict it, and confirm with `fs_usage` or `iostat` that r
 
 - [ ] `--moe-n-slots 4` with 8 experts per token is refused before inference with a message naming the
       required count, not an abort (a single token needs 8 slots, so no group size can help)
-- [ ] `--moe-n-slots 8 --ubatch-size 512 --parallel 4` **starts and runs correctly** (it was refused before
-      token grouping; the group, not the microbatch, is what the pool bounds)
+- [ ] `--moe-n-slots 8 --ubatch-size 512 --parallel 4` is **refused before serving**, naming the graph node
+      budget it would need and the microbatch that would fit. The pool bounds the group rather than the
+      microbatch, so this is no longer a slot-count refusal — a group of one token needs one group per token,
+      and 512 of them per layer asks for a graph budget past the limit. The suggested microbatch is exact:
+      the value the message names must start, and one more than it must be refused.
 - [ ] `--moe-chunk-size 99` with `--moe-n-slots 32` is refused, naming the slots it would need
 - [ ] `--moe-n-slots 8 --n-cpu-moe 4` is refused as a conflict
 - [ ] truncating or replacing the model file mid-run surfaces a propagated error, not a crash

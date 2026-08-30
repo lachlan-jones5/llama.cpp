@@ -335,15 +335,30 @@ effective bandwidth falls accordingly. Throughput is unchanged within run-to-run
 a wash (7.87 ± 0.23 against 8.02 ± 0.08).
 
 So the byte reduction is real, repeatable and deterministic, and the throughput gain is not there on an NVMe
-host. It should matter more where storage is genuinely slow and less on Apple hardware, where cold and warm
-are already within noise. Keep it for the I/O reduction, not for speed, and do not quote a throughput number
-for it.
+host. Keep it for the I/O reduction and do not quote a throughput number for this hardware.
+
+**On Metal it does convert to throughput**, which is the case that matters, and it generalises to a different
+routing shape — an M5 Pro running Qwen3-30B-A3B, 128 experts with 8 used, against the 256/8 above:
+
+| Slots | PP bytes | TG hit rate | Warm PP | Warm TG |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | −10.8 % | +5.80 pp | +4.7 % | +3.2 % |
+| 16 | −12.1 % | +2.13 pp | +12.3 % | +6.1 % |
+| 32 | −12.1 % | +1.63 pp | **+29.9 %** | +19.3 % |
+
+The byte reduction reproduces the figure measured here almost exactly; what differs is that reads are around
+half of Metal's wall clock rather than a fifth, so fewer bytes becomes less time. Treat the byte column as
+solid and the throughput columns as directional — they are short `-p 32 -n 16 -r 3` runs.
+
+**The counters do not need to decay.** `use_count` never decays, so an expert that was popular early could in
+principle hold a slot forever. Over 4096 generated tokens on Metal the hit rate instead *rose* — 68.10 % to
+74.54 % at 16 slots, 82.68 % to 89.70 % at 32 — with no swapping. Note this comparison is against the same
+configuration's 128-token run, which conflates pool warm-up with policy, so the claim it supports is the
+narrow one: nothing rots over a long session. Periodic halving of the counters was also tried offline and
+made no difference, so plain LFU ships without a tuning knob.
 
 Two ideas from this line are still untried: refusing admission to experts routed only once in a ubatch, and
-carrying residency across the requests of one conversation. Note also that `use_count` never decays, so a
-very long session could in principle keep an expert that was popular early; halving the counters
-periodically was tested offline and made no difference over 453 tokens, which is not long enough to settle
-it.
+carrying residency across the requests of one conversation.
 
 **Not a lever: read concurrency.** Already measured — 4, 16 and 32 read threads give identical cold
 bandwidth, because queue depth is bounded by the number of misses in a layer, not by the number of threads.
