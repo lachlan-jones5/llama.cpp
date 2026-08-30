@@ -903,9 +903,31 @@ static const char * ggml_backend_metal_tuning_device_token(ggml_backend_dev_t de
     return ggml_metal_device_id_token(ggml_metal_device_get_props(ctx_dev)->device_id);
 }
 
+// Whether a caller may write into this buffer's memory through a plain host pointer.
+//
+// Every Metal buffer type reports ggml_backend_buffer_is_host() == false, because ggml classifies them as
+// device memory. On Apple unified memory a *shared* buffer is nevertheless backed by a real host-addressable
+// allocation - ggml_metal_buffer_set_tensor is just a memcpy for one - so a caller that can write in place
+// avoids a full extra copy of the data.
+//
+// This must never answer true for a *private* buffer: its base address comes from a synthetic
+// virtual-address allocator and dereferencing it would fault.
+static bool ggml_backend_metal_buffer_is_host_writable(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL || buffer->context == NULL) {
+        return false;
+    }
+
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
+
+    return ggml_metal_buffer_is_shared(ctx);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_buffer_is_host_writable") == 0) {
+        return (void *)ggml_backend_metal_buffer_is_host_writable;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

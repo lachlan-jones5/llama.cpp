@@ -147,6 +147,15 @@ the application". Worth revisiting only if the split cost is ever shown to matte
 the one configuration where splits do grow (+2 per paged layer, ~96 for a 48-layer model). Measure there
 before assuming the CUDA result carries over.
 
+**Done: read straight into unified memory.** Experts used to be read into a staging buffer and handed over
+with `ggml_backend_tensor_set` on every backend whose buffers are not host-addressable. Metal reports
+`ggml_backend_buffer_is_host() == false` for all of its buffer types even when the memory is genuinely
+unified, so it took that path and paid a full second copy of every expert byte. Backends can now answer a
+`ggml_backend_buffer_is_host_writable` query instead; Metal answers it from
+`ggml_metal_buffer_is_shared`, and anything without the entry point falls back to the generic answer, so CPU
+and CUDA are unaffected. Measured motivation: on an M5 Pro, prefill moved 124 GiB at 15.6 GiB/s — RAM speed,
+i.e. the "reads" were cache hits being copied twice.
+
 **Candidate: overlap a layer's reads with compute that does not depend on them.** Today one refill fetches
 the gate, up and down pools together and everything waits. The down projection is not consumed until after
 the gate/up matmuls have run, so the refill could be split: fill gate/up, let compute proceed, and fetch down

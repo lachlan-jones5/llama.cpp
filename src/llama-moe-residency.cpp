@@ -534,6 +534,36 @@ void llama_moe_reader::reset_stats() {
 // llama_moe_residency
 //
 
+// Can experts be read straight into this buffer, or do they have to be staged and copied in?
+//
+// ggml_backend_buffer_is_host() is the obvious answer and is right for CPU, but it is deliberately false for
+// every Metal buffer type even when the memory is genuinely unified and host-addressable. Taking it at face
+// value there costs a full second copy of every expert byte, which on unified memory is the dominant cost.
+//
+// So ask the backend first, through a named entry point, and fall back to the generic answer when a backend
+// does not provide one. Looking it up by name keeps this file free of any backend's headers.
+static bool llama_moe_buffer_is_host_writable(ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    ggml_backend_dev_t         dev  = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    ggml_backend_reg_t         reg  = dev  ? ggml_backend_dev_backend_reg(dev)  : nullptr;
+
+    if (reg != nullptr) {
+        using is_host_writable_t = bool (*)(ggml_backend_buffer_t);
+
+        auto fn = (is_host_writable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_is_host_writable");
+
+        if (fn != nullptr) {
+            return fn(buf);
+        }
+    }
+
+    return ggml_backend_buffer_is_host(buf);
+}
+
 void llama_moe_residency::latch(llama_moe_status status, std::string detail) {
     if (status == LLAMA_MOE_STATUS_OK) {
         return;
@@ -666,9 +696,7 @@ ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * ori
     pool.slot_stride = pool.tensor->nb[2];  // distance between slots in the pool
     pool.read_size   = pool.info.stride;    // bytes one expert occupies on disk
 
-    // CPU buffers can be read into directly; device memory has to go through staging. Metal reports false
-    // here even for unified memory, so it takes the staging path too - correct, just not yet optimal.
-    pool.host_writable = ggml_backend_buffer_is_host(pool.buf.get());
+    pool.host_writable = llama_moe_buffer_is_host_writable(pool.buf.get());
 
     // The two are separate quantities and treating them as one would silently read the wrong bytes, so
     // require them to agree rather than assuming it.
