@@ -636,6 +636,28 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    // A small slot count with a large microbatch is the one combination that cannot work. The expert group
+    // is n_slots/n_expert_used tokens, so 8 slots on an 8-expert model gives a group of one token and needs
+    // one group per token - 512 groups per layer at --ubatch-size 512. The scheduler then sizes its context
+    // buffer for the worst case of one split per node (ggml-backend.cpp: max_splits = graph_size), which is
+    // 30*2*sizeof(ggml_tensor) = ~19.7 KiB per node, so a two-million-node budget asks for about 40 GiB and
+    // the allocation simply fails. Say so here, with the two numbers that fix it, rather than letting it
+    // surface as GGML_ASSERT(ctx->mem_buffer != NULL) inside ggml_init.
+    if (moe_res != nullptr && max_nodes > LLAMA_MOE_MAX_GRAPH_NODES) {
+        const int32_t chunk    = moe_res->chunk_size();
+        const uint32_t n_group = (n_tokens + chunk - 1) / chunk;
+
+        const uint32_t n_ub_max = (uint32_t) std::max(1, chunk) *
+            std::max<uint32_t>(1, (uint32_t) ((uint64_t) n_group * LLAMA_MOE_MAX_GRAPH_NODES / max_nodes));
+
+        throw std::runtime_error(format(
+            "expert paging: --moe-n-slots %d gives a group of %d token(s), so a microbatch of %u needs %u "
+            "expert groups and a graph budget of %zu nodes, past the %zu-node limit. Either lower "
+            "--ubatch-size to %u or below, or raise --moe-n-slots so each group covers more tokens.",
+            moe_res->slots(), chunk, n_tokens, n_group, max_nodes,
+            (size_t) LLAMA_MOE_MAX_GRAPH_NODES, n_ub_max));
+    }
+
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 

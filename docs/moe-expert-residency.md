@@ -80,10 +80,27 @@ not as a number to quote for a long prompt.
 roughly 21.5 KB per node — dominated by the scheduler's context buffer, not tensor overhead — that is about
 1.5 GB of host memory against 250 MB.
 
-**A small slot count with a large microbatch is a trap.** The group is `n_slots / n_expert_used`, so
-`--moe-n-slots 8` on an 8-expert-per-token model gives a group of 1 and needs one group per token: at
-`--ubatch-size 512` that is 512 groups per layer, and the node budget it implies can exceed available memory
-outright. Pair a small slot count with a small microbatch.
+**A small slot count with a large microbatch is refused, and the message says what to change.** The group is
+`n_slots / n_expert_used`, so `--moe-n-slots 8` on an 8-expert-per-token model gives a group of one token and
+needs one group per token: at `--ubatch-size 512` that is 512 groups in every layer, a two-million-node graph
+budget, and — because the scheduler reserves its context buffer for one split per node at ~19.7 KiB each — an
+allocation of about 40 GiB that simply fails. That used to surface as
+`GGML_ASSERT(ctx->mem_buffer != NULL)` from inside `ggml_init`, which says nothing useful. It is now caught
+before the scheduler is built:
+
+```
+expert paging: --moe-n-slots 8 gives a group of 1 token(s), so a microbatch of 512 needs 512 expert groups
+and a graph budget of 2019328 nodes, past the 1048576-node limit. Either lower --ubatch-size to 265 or
+below, or raise --moe-n-slots so each group covers more tokens.
+```
+
+The suggested microbatch is exact — 265 runs and 266 is refused. Pair a small slot count with a small
+microbatch, or raise the slot count so each group covers more tokens.
+
+Worth knowing if this limit is ever in the way: the per-group node allowance is deliberately generous, about
+8.5x the nodes a group actually uses (measured 11.3 per group per layer against a budget of 96), and the
+scheduler's own `max_splits = graph_size` assumption is what turns nodes into gigabytes. Tightening either
+would move this limit a long way out.
 
 ### The saturation point applies to the group, not the microbatch
 

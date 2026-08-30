@@ -119,6 +119,12 @@ private:
     llama_moe_layer_stats st;
 };
 
+// Largest graph node budget expert paging may ask for. The scheduler reserves its context buffer for one
+// split per node, at roughly 19.7 KiB each, so this is about 20 GiB of address space - already generous,
+// and chosen to leave every configuration that has been measured working. Past it the allocation fails
+// outright, so the limit exists to turn that into a message naming the microbatch that would fit.
+#define LLAMA_MOE_MAX_GRAPH_NODES 1048576u
+
 // Smallest pool that can serve any ubatch: a ubatch routes at most n_expert_used experts per token, and
 // never more distinct experts than the layer has.
 int32_t llama_moe_min_slots(int32_t n_expert, int32_t n_expert_used, int32_t n_ubatch);
