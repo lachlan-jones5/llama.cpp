@@ -470,6 +470,59 @@ static void common_params_fit_impl(
         dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmds_full);
+
+        // Every projection above was taken on the unpaged model, and paging changes both what the model
+        // costs and what the pools cost. Without recomputing them the steps below reason about a
+        // configuration that no longer exists: they report the unpaged deficit, try to reduce a context that
+        // is already fine, and can abort with a failure for memory that has in fact just been freed.
+        sum_free            = 0;
+        sum_projected_free  = 0;
+        sum_projected_used  = 0;
+        sum_projected_model = 0;
+        projected_free_per_device.clear();
+
+        if (nd == 0) {
+            sum_projected_used = dmds_full.back().mb.total();
+            sum_free           = dmds_full.back().total;
+            sum_projected_free = sum_free - sum_projected_used;
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                const llama_device_memory_data & dmd = dmds_full[id];
+
+                const int64_t projected_used = dmd.mb.total();
+                const int64_t projected_free = dmd.free - projected_used;
+
+                projected_free_per_device.push_back(projected_free);
+
+                sum_free            += dmd.free;
+                sum_projected_used  += projected_used;
+                sum_projected_free  += projected_free;
+                sum_projected_model += dmd.mb.model;
+            }
+        }
+
+        LOG_TRC("%s: after sizing the expert pool: %" PRId64 " MiB used, %" PRId64 " MiB free\n",
+            __func__, sum_projected_used/MiB, sum_projected_free/MiB);
+
+        // Paging may have freed enough on its own, in which case there is nothing left to do. Without this
+        // the function falls through to steps that reduce the context and the layer count, and then to their
+        // unconditional failure paths - so a model that now fits would still be reported as not fitting.
+        bool fits = true;
+        if (nd == 0) {
+            fits = sum_projected_free >= margins[0];
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                if (projected_free_per_device[id] < margins[id]) {
+                    fits = false;
+                    break;
+                }
+            }
+        }
+
+        if (fits) {
+            LOG_TRC("%s: expert paging freed enough memory, no further changes needed\n", __func__);
+            return;
+        }
     }
 
 
