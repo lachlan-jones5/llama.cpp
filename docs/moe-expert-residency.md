@@ -11,14 +11,41 @@ model does not fit, but its working set does.**
 
 | Option | Meaning |
 | --- | --- |
-| `--moe-n-slots N` | Keep `N` experts of each paged layer resident. `0` (default) disables paging entirely. |
+| `--moe-n-slots N` | Keep `N` experts of each paged layer resident. `0` (default) disables paging entirely. `auto` pages and lets the fit pass choose `N`. |
 | `--moe-n-layers N` | Page only the first `N` MoE layers. `0` (default) pages every MoE layer. |
 | `--moe-chunk-size N` | Tokens per expert-matmul group. `0` (default) derives it as `n_slots / n_expert_used`. |
 | `--moe-read-threads N` | Threads used to read experts. `0` (default) picks a sensible number. |
 
 Each has a matching `LLAMA_ARG_*` environment variable.
 
-### Choosing a slot count
+### Prefer `--moe-n-slots auto`
+
+The slot count is the single most consequential setting, and it is genuinely hard to choose by hand. On
+Metal, Qwen3-30B-A3B at `pp8192 -ub 512`, going from 32 to 64 slots is **+80.7 % prefill and −78.8 % bytes
+read** — more than any other change measured on this feature. It matters twice over: a bigger pool caches
+more, *and* a bigger pool means a bigger group, so the microbatch is cut into fewer pieces and the same
+expert is reloaded far less often.
+
+`auto` asks the fit pass to pick it:
+
+- If the model fits **without** paging, it leaves paging off. Paging a model that already fits only adds
+  the grouped-execution cost — measured at **3.4× slower** on a fully hot pool, where no I/O happens at all.
+- Otherwise it sizes the pool *before* reducing the context, since paging experts is the cheaper way to free
+  memory and context is usually what you want to keep.
+- It probes twice and interpolates. Pools are exactly linear in the slot count, so two measurements give the
+  per-slot cost per device including alignment.
+- It clamps to the range below, and refuses with both bounds named if that range is empty.
+
+An explicit `--moe-n-slots N` is never overridden, following the fit's convention of only adjusting
+parameters left at their default.
+
+**One thing `auto` cannot see: page-cache pressure.** With `--load-mode none` the model file is streamed
+through the page cache, which on unified memory competes with everything else. A 24 GiB Mac running 64 slots
+took 2.7 GiB of swap even though device accounting said it fit; the configuration that passed had 31 % still
+free. If a chosen count swaps, raise `--fit-target` and re-run — and treat swap counters, not the
+projection, as the evidence.
+
+### Choosing a slot count by hand
 
 A group of `N` tokens can route to `n_expert_used * N` distinct experts, and every one of them has to be
 resident at the same time. So the slot count sets the group size:

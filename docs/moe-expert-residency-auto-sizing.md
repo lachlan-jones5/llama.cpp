@@ -1,7 +1,18 @@
-# Plan: choose the slot count automatically
+# Choosing the slot count automatically — design record
 
-Status: **not implemented**. This is a design record, written before any code, in the same spirit as the
-optimisation log in `moe-expert-residency.md`.
+Status: **implemented** as `--moe-n-slots auto`. User-facing behaviour is documented in
+`moe-expert-residency.md`; this file keeps the reasoning behind it, including the parts that were rejected.
+
+Two things changed between this design and what shipped, both worth knowing:
+
+- **Per-slot cost is measured, not derived.** The plan said to compute it from `llama_moe_tensor_info::stride`,
+  the on-disk expert size. That is *not* the pool's slot stride — the pool tensor's `nb[2]` can differ
+  through alignment — so it would have under-estimated, and under-estimating is exactly what causes swap.
+  Two probes and an interpolation give the real figure per device instead, and need no new accessor.
+- **The graph floor is needed for more than the clamp.** The first probe has to sit above it. Probing at
+  `n_expert_used` with a large microbatch gives a group of one token, hundreds of groups per layer, and a
+  context that fails to build for a reason unrelated to memory. `llama_moe_min_slots_for_graph()` exists
+  because of that failure, not in anticipation of it.
 
 ## Why
 
