@@ -523,6 +523,27 @@ static void common_params_fit_impl(
             LOG_TRC("%s: expert paging freed enough memory, no further changes needed\n", __func__);
             return;
         }
+
+        // Paging did what it could and fell short. The steps below only ever adjust the context size and the
+        // layer count, and this function is not allowed to touch either when the user set it - so if both
+        // were set explicitly, all that remains is an abort naming one of them. The caller ignores the
+        // result and loads the model anyway, so that abort is misleading noise on a run that then works.
+        // Report what actually happened instead.
+        if (n_slots_fit > 0 && !n_ctx_auto && mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+            int64_t shortfall = 0;
+            if (nd == 0) {
+                shortfall = margins[0] - sum_projected_free;
+            } else {
+                for (size_t id = 0; id < nd; id++) {
+                    shortfall = std::max(shortfall, margins[id] - projected_free_per_device[id]);
+                }
+            }
+
+            LOG_WRN("%s: expert paging brought memory use to %" PRId64 " MiB, still %" PRId64 " MiB short of "
+                "the free-memory target; context size and layer count were both set explicitly, so there is "
+                "nothing further to adjust\n", __func__, sum_projected_used/MiB, shortfall/MiB);
+            return;
+        }
     }
 
 
