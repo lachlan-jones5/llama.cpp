@@ -43,8 +43,11 @@ The expert path runs in **groups** of `--moe-chunk-size` tokens (default `n_slot
 Attention and the dense path still see the whole microbatch; only the expert matmuls are grouped. Since the
 MoE FFN is per-token this is a regrouping of identical arithmetic, and it is verified bit-exact.
 
-The consequence is that the bound below applies to the **group**, not the microbatch. `--moe-n-slots 8` with
-`--ubatch-size 512 --parallel 4` is a valid configuration; before, it could not start.
+The consequence is that the bound below applies to the **group**, not the microbatch, so the slot count no
+longer has to scale with `--ubatch-size` or `--parallel`. What replaces it is a limit on the number of
+groups rather than on the microbatch: a slot count small enough to give a group of one token needs one group
+per token, and enough of those exceed the graph node budget and are refused with the microbatch that would
+fit (see *A small slot count with a large microbatch* below).
 
 **The throughput gain from this is modest — measure before relying on it.** On CUDA at full GPU residency,
 32 slots, `pp256`:
@@ -268,11 +271,35 @@ unified, so it took that path and paid a full second copy of every expert byte. 
 and CUDA are unaffected. Measured motivation: on an M5 Pro, prefill moved 124 GiB at 15.6 GiB/s — RAM speed,
 i.e. the "reads" were cache hits being copied twice.
 
-**Candidate: overlap a layer's reads with compute that does not depend on them.** Today one refill fetches
-the gate, up and down pools together and everything waits. The down projection is not consumed until after
-the gate/up matmuls have run, so the refill could be split: fill gate/up, let compute proceed, and fetch down
-concurrently. That hides roughly a third of the read stall, needs no device stall, and leaves the admission
-policy and the correctness tests untouched. This is the most promising of the three.
+**Rejected after building it: overlap a layer's reads with compute that does not depend on them.** The down
+projection is not consumed until the gate/up matmuls have run and is 45 % of the bytes an expert occupies, so
+the refill was split — read gate/up, leave the down read in flight, collect it just before the matmul that
+consumes it. It was implemented, verified byte-identical on CPU, CUDA and Metal, measured, and removed.
+
+The mechanism worked and was still a loss on every backend:
+
+| | prefill | generation | graph splits |
+| --- | ---: | ---: | ---: |
+| CUDA, 32 slots | −16.9 % | −10.6 % | 82 → 162 |
+| Metal, 16 slots | −13.9 % | −15.3 % | 98 → 194 |
+| Metal, 32 slots | −17.1 % | −22.1 % | 98 → 194 |
+| CPU, 32 slots | +0.6 % (noise) | — | 1 → 1 |
+
+Collecting the read needs a host-side node between two device matmuls, and the scheduler splits the graph
+around every one — exactly **two extra splits per paged layer**. Each split is a device synchronisation, and
+that costs more than the overlap hides. Read time did fall, so the reads genuinely finished sooner; the wall
+clock still got worse.
+
+**The premise was sound, which is why this is worth recording rather than just deleting.** A clean
+measurement on Metal (`-r 1 --no-warmup`, so the read statistics and the throughput denominator cover the
+same tokens) puts reads at **51-59 % of wall time** at microbatch 1 — there really was about half the run
+available to hide behind. What sank it is that any host-side wait between two device matmuls costs a split,
+and the split is worth more than the read. The only way to wait without one is a device-side wait, which is
+the handshake rejected above for its deadlock risk. Earlier figures of 82 % came from a warmup-contaminated
+shape and should not be reused.
+
+On CPU it was a wash for a different reason: the reader threads and the compute threads are the same cores,
+so there is no second execution resource for the read to overlap with.
 
 **Done: chunk the microbatch inside the MoE layer** — shipped as token groups; see *Token groups* above for
 what it delivered (**+9.1 %** prefill at microbatch 512, +6.9 % at 64, against the old ceiling of 4). The

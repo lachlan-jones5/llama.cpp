@@ -21,7 +21,6 @@ struct llama_layer;
 
 struct llama_memory_context_i;
 struct llama_moe_residency;
-struct llama_moe_resolve_ctx;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -1133,10 +1132,6 @@ struct llm_graph_context {
         llm_ffn_op_type type_op;
 
         bool weight_before_ffn;
-
-        // Non-null when this layer is paged: the handle the wait node uses to collect the deferred
-        // down-projection read, placed between the gate/up matmuls and the one that consumes it.
-        llama_moe_resolve_ctx * moe_rc;
 
         int il;
     };

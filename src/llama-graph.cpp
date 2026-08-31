@@ -1566,23 +1566,6 @@ static void llm_moe_resolve_op(ggml_tensor * dst, int ith, int nth, void * userd
     rc->res->resolve(rc->il, (const int32_t *) ids->data, (int32_t) ggml_nelements(ids), (int32_t *) dst->data);
 }
 
-// Collects the down-projection read that resolve() left in flight. Placed on the activation that feeds the
-// down matmul, so the read overlaps the gate/up matmuls and is collected exactly once, immediately before
-// the first thing that reads the pool it fills.
-static void llm_moe_wait_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(dst);
-    GGML_UNUSED(nth);
-
-    if (ith != 0) {
-        return;
-    }
-
-    auto * rc = (llama_moe_resolve_ctx *) userdata;
-
-    // as with the resolve, a failure is latched and fails the decode once the graph finishes
-    rc->res->wait_deferred(rc->il);
-}
-
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -2175,12 +2158,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        auto bind = [&](ggml_tensor * orig, bool deferred = false) -> ggml_tensor * {
+        auto bind = [&](ggml_tensor * orig) -> ggml_tensor * {
             if (orig == nullptr) {
                 return nullptr;
             }
 
-            ggml_tensor * pool = moe_res->bind_pool(il, orig, buft, deferred);
+            ggml_tensor * pool = moe_res->bind_pool(il, orig, buft);
 
             // On failure the error is latched in the residency manager and the decode is aborted before
             // anything is computed, so returning orig here never reaches a kernel.
@@ -2190,11 +2173,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         gate_up_exps = bind(gate_up_exps);
         up_exps      = bind(up_exps);
         gate_exps    = bind(gate_exps);
-        // The down projection is the one weight the FFN does not need immediately - it consumes the gate/up
-        // activation - so its read can be left in flight and collected just before the matmul that uses it.
-        // Off unless asked for: the collecting node costs two graph splits per layer, which on CUDA is a
-        // clear loss. See llama_moe_params::overlap_reads.
-        down_exps    = bind(down_exps, /*deferred =*/ moe_res->overlap_reads());
+        down_exps    = bind(down_exps);
 
         // The pools hold n_slots experts, not n_expert, so the matmuls below must be indexed by slot.
         rc = moe_res->resolve_ctx(il);
@@ -2241,7 +2220,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.n_expert_used    =*/ n_expert_used,
         /*.type_op          =*/ type_op,
         /*.weight_before_ffn=*/ weight_before_ffn,
-        /*.moe_rc           =*/ moe_res != nullptr && moe_res->overlap_reads() ? rc : nullptr,
         /*.il               =*/ il,
     };
 
@@ -2466,14 +2444,6 @@ ggml_tensor * llm_graph_context::build_moe_experts(const moe_expert_args & args)
             } break;
         default:
             GGML_ABORT("fatal error");
-    }
-
-    // Everything above consumed only the gate/up weights, so the down-projection read has been running for
-    // the whole of it. Collect it here, on the activation the matmul below is about to read: an in-place
-    // custom op is a view, so this orders the wait without copying anything.
-    if (args.moe_rc != nullptr) {
-        cur = ggml_custom_inplace(ctx0, cur, nullptr, 0, llm_moe_wait_op, 1, args.moe_rc);
-        cb(cur, "ffn_moe_down_ready", il);
     }
 
     experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s, selected_experts); // [n_embd, n_expert_used, n_tokens]

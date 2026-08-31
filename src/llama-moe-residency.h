@@ -181,20 +181,6 @@ struct llama_moe_reader {
     // in the batch, so it completes even if no workers were started.
     llama_moe_status read_many(const llama_moe_read_req * reqs, size_t n);
 
-    // Hand a batch to the workers and return without waiting, so the caller can do other work while it runs.
-    // reqs must stay alive and unmodified until wait() returns.
-    //
-    // Still one batch at a time: there must be no batch in flight, and the next read_many() or submit() has
-    // to be preceded by wait(). With no worker threads there is nobody to service it, so the reads happen on
-    // the calling thread here and wait() has nothing left to do.
-    llama_moe_status submit(const llama_moe_read_req * reqs, size_t n);
-
-    // Wait for the batch submitted by submit() and return its first error. No-op when nothing is in flight.
-    llama_moe_status wait();
-
-    // true if a submitted batch has not been waited for yet
-    bool in_flight() const { return pending; }
-
     // Start n_threads workers. 0 or 1 keeps everything on the calling thread.
     llama_moe_status start_workers(int32_t n_threads);
 
@@ -231,12 +217,6 @@ private:
     const llama_moe_read_req * cur_reqs = nullptr;
     size_t                     cur_n    = 0;
     uint64_t                   gen      = 0;  // bumped per batch so workers can tell batches apart
-    bool                       pending  = false;  // a submit() is outstanding and wait() still owes it
-
-    // shared by read_many() and submit(): publish the batch and wake the workers
-    void publish(const llama_moe_read_req * reqs, size_t n);
-    // shared by read_many() and wait(): block until the published batch is done, then clear it
-    llama_moe_status collect();
 
     std::atomic<size_t>   next_idx {0};
     std::atomic<size_t>   n_done   {0};
@@ -268,11 +248,6 @@ struct llama_moe_pool {
     // True when the pool buffer can be written through a plain host pointer, so an expert can be read
     // straight into its slot. False for device memory, where the read goes to staging and is then copied in.
     bool host_writable = false;
-
-    // True for a weight the layer does not consume until later in its own FFN - in practice the down
-    // projection, which is not needed until the gate/up matmuls have produced their activation. Those reads
-    // are started by resolve() and collected by wait_deferred(), so they run while the matmuls do.
-    bool deferred = false;
 };
 
 // All pools of one layer share a residency map, so they evict in lockstep and a single remapped id array
@@ -312,11 +287,7 @@ struct llama_moe_residency {
     // Called while the graph is built: hands back the pool tensor that replaces orig, allocating it on
     // first use in the same buffer type as the layer's resident weights. Returns null if orig is not a
     // paged tensor or the pool could not be allocated; the error is latched either way.
-    //
-    // deferred marks a weight the FFN does not consume until after its earlier matmuls, so its read can be
-    // left in flight; the caller must then place a wait_deferred() before whatever reads the pool.
-    ggml_tensor * bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft,
-            bool deferred = false);
+    ggml_tensor * bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft);
 
     // true if this layer has anything paged
     bool is_paged_layer(int32_t il) const;
@@ -328,10 +299,6 @@ struct llama_moe_residency {
     // reads in-bounds nonsense rather than running off the end of the pool; the error is latched and the
     // decode is failed once the graph finishes.
     llama_moe_status resolve(int32_t il, const int32_t * ids, int32_t n, int32_t * out_slots);
-
-    // Collect the deferred reads resolve() left in flight for this layer, and hand any staged experts to the
-    // backend. Must run before anything reads a deferred pool. Safe to call when nothing is outstanding.
-    llama_moe_status wait_deferred(int32_t il);
 
     // Stable per-layer handle for the graph node that performs the resolve. Valid until shutdown.
     llama_moe_resolve_ctx * resolve_ctx(int32_t il);
@@ -352,9 +319,6 @@ struct llama_moe_residency {
 
     int32_t slots() const { return n_slots; }
 
-    // true when the down-projection read should be left in flight across the gate/up matmuls
-    bool overlap_reads() const { return overlap; }
-
     // Bytes the slot pools occupy, keyed by the buffer type each was allocated on. Pools are created during
     // graph building, so this is empty until a graph has been built - but the reserve pass in the context
     // constructor builds one, so it is populated by the time anything asks.
@@ -372,7 +336,6 @@ private:
 
     int32_t n_slots = 0;
     int32_t chunk   = 1;
-    bool    overlap = false;
 
     // indexed by layer; layers that are not paged are left empty
     std::vector<llama_moe_layer> layers;
@@ -399,13 +362,6 @@ private:
     std::vector<llama_moe_fill>     fills;   // scratch, reused across resolves
     std::vector<llama_moe_read_req> reqs;    // scratch, reused across resolves
     std::vector<staged_copy>        staged;  // scratch, reused across resolves
-
-    // Separate scratch for the deferred batch. It cannot share the vectors above: the reader holds a bare
-    // pointer into it until wait_deferred(), so the next resolve() must be free to refill its own without
-    // disturbing a read that is still running.
-    std::vector<llama_moe_read_req> reqs_deferred;
-    std::vector<staged_copy>        staged_deferred;
-    int32_t                         il_deferred = -1;  // layer owning the outstanding batch, -1 if none
 
     // Reusable staging for pools that cannot be written directly. Allocated once and grown as needed, never
     // per token. Pinned when the backend provides a host buffer type, otherwise ordinary memory.

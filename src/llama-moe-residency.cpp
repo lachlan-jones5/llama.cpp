@@ -484,84 +484,6 @@ llama_moe_status llama_moe_reader::start_workers(int32_t n_threads) {
     return LLAMA_MOE_STATUS_OK;
 }
 
-void llama_moe_reader::publish(const llama_moe_read_req * reqs, size_t n) {
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        cur_reqs = reqs;
-        cur_n    = n;
-
-        next_idx .store(0, std::memory_order_relaxed);
-        n_done   .store(0, std::memory_order_relaxed);
-        first_err.store((int) LLAMA_MOE_STATUS_OK, std::memory_order_relaxed);
-
-        gen++;
-    }
-
-    cv_work.notify_all();
-}
-
-llama_moe_status llama_moe_reader::collect() {
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-
-        cv_done.wait(lock, [this] { return n_done.load(std::memory_order_acquire) >= cur_n; });
-
-        cur_reqs = nullptr;
-        cur_n    = 0;
-    }
-
-    return (llama_moe_status) first_err.load(std::memory_order_relaxed);
-}
-
-llama_moe_status llama_moe_reader::submit(const llama_moe_read_req * reqs, size_t n) {
-    if (n == 0) {
-        return LLAMA_MOE_STATUS_OK;
-    }
-
-    if (reqs == nullptr || pending) {
-        return LLAMA_MOE_STATUS_INVALID_CONFIG;
-    }
-
-    if (stopping.load(std::memory_order_relaxed)) {
-        return LLAMA_MOE_STATUS_CANCELLED;
-    }
-
-    // With no workers nobody would ever service the batch, so there is nothing to defer to - do the reads
-    // here and leave wait() with nothing owed. The caller still gets the same answer, just no overlap.
-    if (workers.empty()) {
-        return read_many(reqs, n);
-    }
-
-    publish(reqs, n);
-
-    pending = true;
-
-    return LLAMA_MOE_STATUS_OK;
-}
-
-llama_moe_status llama_moe_reader::wait() {
-    if (!pending) {
-        return LLAMA_MOE_STATUS_OK;
-    }
-
-    // Only the span the caller actually blocks for counts as read time; whatever overlapped the gate/up
-    // matmuls cost nothing. Timing the whole submit-to-wait window instead would report the read as
-    // expensive as before and hide exactly the effect this exists to produce.
-    const auto t_start = std::chrono::steady_clock::now();
-
-    const llama_moe_status status = collect();
-
-    pending = false;
-
-    st_t_read_us.fetch_add(
-        (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t_start).count(),
-        std::memory_order_relaxed);
-
-    return status;
-}
-
 llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, size_t n) {
     if (n == 0) {
         return LLAMA_MOE_STATUS_OK;
@@ -574,11 +496,6 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
     if (stopping.load(std::memory_order_relaxed)) {
         return LLAMA_MOE_STATUS_CANCELLED;
     }
-
-    // Publishing over a batch that is still in flight would leave the workers reading a stale cur_reqs.
-    // The caller is not supposed to get here with one outstanding, but collecting it is the only safe
-    // response - the alternative is a dangling pointer rather than a diagnosable error.
-    wait();
 
     const auto t_start = std::chrono::steady_clock::now();
 
@@ -593,12 +510,34 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
             }
         }
     } else {
-        publish(reqs, n);
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+
+            cur_reqs = reqs;
+            cur_n    = n;
+
+            next_idx .store(0, std::memory_order_relaxed);
+            n_done   .store(0, std::memory_order_relaxed);
+            first_err.store((int) LLAMA_MOE_STATUS_OK, std::memory_order_relaxed);
+
+            gen++;
+        }
+
+        cv_work.notify_all();
 
         // the caller is a worker too, so the batch still completes even if every worker has exited
         drain(reqs, n);
 
-        status = collect();
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+
+            cv_done.wait(lock, [this] { return n_done.load(std::memory_order_acquire) >= cur_n; });
+
+            cur_reqs = nullptr;
+            cur_n    = 0;
+        }
+
+        status = (llama_moe_status) first_err.load(std::memory_order_relaxed);
     }
 
     const auto t_end = std::chrono::steady_clock::now();
@@ -611,12 +550,6 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
 }
 
 void llama_moe_reader::shutdown() {
-    // A submitted batch points at caller memory and is being written by the workers. Joining them without
-    // collecting it first would leave cur_reqs dangling and the destinations half-written; drain it while
-    // the workers are still alive. drain() turns every remaining request into CANCELLED once stopping is
-    // set, so this cannot block on I/O that will never finish.
-    wait();
-
     if (workers.empty()) {
         stopping.store(true, std::memory_order_relaxed);
         return;
@@ -726,8 +659,6 @@ llama_moe_status llama_moe_residency::init(
         chunk = 1;
     }
 
-    overlap = params.overlap_reads;
-
     // an explicit override may ask for more than the slots can hold
     if ((int64_t) n_expert_used * chunk > n_slots) {
         return LLAMA_MOE_STATUS_INVALID_CONFIG;
@@ -778,8 +709,7 @@ bool llama_moe_residency::is_paged_layer(int32_t il) const {
     return il >= 0 && (size_t) il < layers.size() && layers[(size_t) il].cache.n_slots() > 0;
 }
 
-ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * orig,
-        ggml_backend_buffer_type_t buft, bool deferred) {
+ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * orig, ggml_backend_buffer_type_t buft) {
     if (!is_paged_layer(il) || orig == nullptr || buft == nullptr) {
         return nullptr;
     }
@@ -843,7 +773,6 @@ ggml_tensor * llama_moe_residency::bind_pool(int32_t il, const ggml_tensor * ori
     pool.read_size   = pool.info.stride;    // bytes one expert occupies on disk
 
     pool.host_writable = llama_moe_buffer_is_host_writable(pool.buf.get());
-    pool.deferred      = deferred;
 
     // The two are separate quantities and treating them as one would silently read the wrong bytes, so
     // require them to agree rather than assuming it.
@@ -887,18 +816,9 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
         return LLAMA_MOE_STATUS_OK; // everything the ubatch needs is already resident
     }
 
-    // A deferred batch from the previous layer must be collected before its scratch can be refilled. In a
-    // well-formed graph the wait node already did this; belt and braces for the paths that skip it, such as
-    // an aborted decode.
-    if (reader.in_flight()) {
-        wait_deferred(il_deferred);
-    }
-
     // every pool of the layer evicts in lockstep, so one admission means one read per pool
     reqs.clear();
     staged.clear();
-    reqs_deferred.clear();
-    staged_deferred.clear();
     reqs.reserve(fills.size() * layer.pools.size());
 
     // size the staging area for the pools that cannot be written directly
@@ -937,9 +857,6 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
             return LLAMA_MOE_STATUS_BACKEND_ERROR;
         }
 
-        auto & pool_reqs   = pool.deferred ? reqs_deferred   : reqs;
-        auto & pool_staged = pool.deferred ? staged_deferred : staged;
-
         for (const auto & fill : fills) {
             const size_t slot_off = (size_t) fill.slot * pool.slot_stride;
 
@@ -949,11 +866,11 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
                 dst = base + slot_off;
             } else {
                 dst = staging + staging_off;
-                pool_staged.push_back({ &pool, staging_off, slot_off });
+                staged.push_back({ &pool, staging_off, slot_off });
                 staging_off += pool.read_size;
             }
 
-            pool_reqs.push_back({
+            reqs.push_back({
                 /*.file_idx =*/ pool.info.file_idx,
                 /*.offset   =*/ pool.info.offset + (uint64_t) fill.expert * pool.info.stride,
                 /*.dst      =*/ dst,
@@ -962,9 +879,6 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
         }
     }
 
-    // The immediate reads have to finish first: the reader holds one batch at a time, so submitting the
-    // deferred one before this would only get collected here. Nothing is lost by the order - what the
-    // deferred read overlaps is the matmuls after resolve() returns, not this read.
     const llama_moe_status io = reader.read_many(reqs.data(), reqs.size());
 
     if (io != LLAMA_MOE_STATUS_OK) {
@@ -979,60 +893,6 @@ llama_moe_status llama_moe_residency::resolve(int32_t il, const int32_t * ids, i
     for (const auto & copy : staged) {
         ggml_backend_tensor_set(copy.pool->tensor, staging + copy.staging_off, copy.slot_off, copy.pool->read_size);
     }
-
-    // Now leave the deferred reads running. They proceed while the caller builds and runs the matmuls that
-    // do not depend on them; wait_deferred() collects them before the one that does. With no worker threads
-    // submit() reads here instead, which is correct but overlaps nothing.
-    if (!reqs_deferred.empty()) {
-        const llama_moe_status sub = reader.submit(reqs_deferred.data(), reqs_deferred.size());
-
-        if (sub != LLAMA_MOE_STATUS_OK) {
-            layer.cache.invalidate();
-            std::fill(out_slots, out_slots + n, 0);
-            latch(sub, "layer " + std::to_string(il) + ": " + llama_moe_status_str(sub));
-            return sub;
-        }
-
-        il_deferred = il;
-
-        // submit() falls back to reading inline when there are no workers, so the staged handoff may already
-        // be due; wait_deferred() is a no-op on the reader in that case and just performs the copies.
-        if (!reader.in_flight()) {
-            return wait_deferred(il);
-        }
-    }
-
-    return LLAMA_MOE_STATUS_OK;
-}
-
-llama_moe_status llama_moe_residency::wait_deferred(int32_t il) {
-    if (il_deferred < 0) {
-        return LLAMA_MOE_STATUS_OK;  // nothing was deferred for this layer
-    }
-
-    const int32_t il_owner = il_deferred;
-
-    il_deferred = -1;
-
-    const llama_moe_status io = reader.wait();
-
-    if (io != LLAMA_MOE_STATUS_OK) {
-        // the deferred slots hold undefined bytes, so the layer that owns them loses residency
-        if (il_owner >= 0 && (size_t) il_owner < layers.size()) {
-            layers[(size_t) il_owner].cache.invalidate();
-        }
-
-        latch(io, "layer " + std::to_string(il_owner) + ": " + llama_moe_status_str(io));
-        return io;
-    }
-
-    for (const auto & copy : staged_deferred) {
-        ggml_backend_tensor_set(copy.pool->tensor, staging + copy.staging_off, copy.slot_off, copy.pool->read_size);
-    }
-
-    staged_deferred.clear();
-
-    GGML_UNUSED(il);
 
     return LLAMA_MOE_STATUS_OK;
 }
