@@ -1,88 +1,93 @@
-# Plan: a memory margin that survives paged reads
+# Plan: how aggressively should `auto` spend memory?
 
-Status: **not implemented, and deliberately not yet designed in detail.** We have one observation, and one
-observation is not a margin policy. This records what is known, what the competing explanations are, and
-which measurement distinguishes them.
+Status: **not implemented.** The mechanism to control this already exists (`--fit-target`); what is missing
+is a sensible default when paging is enabled automatically, and that default cannot be chosen from the data
+we have.
 
-## Why
+## Why this is not a safety gate
 
-`--moe-n-slots auto` picks the largest slot count that fits, using per-device free memory less a margin. On
-the development host that works. On the 24 GiB Mac it is not yet safe, because a configuration that device
-accounting said would fit **took 2,657 MiB of swap and 182,368 swapouts**:
+The first framing of this document was wrong. It treated any swap as failure and asked "what margin
+guarantees no swapouts?". The actual criterion is whether the machine is **usable for the job it is doing**:
 
-| Configuration | Metal in use | Free after | Result |
-| --- | ---: | ---: | --- |
-| 32 slots, 40,960 ctx | 10,681 MiB | 7,503 MiB (31 %) | passed, no new swapouts |
-| 64 slots | ~17,400 MiB | ~800 MiB | **swapped 2.7 GiB** |
+> A one-time displacement of inactive pages is acceptable. Sustained swap churn that stalls the agent is not.
 
-The projection was not obviously wrong; it simply measured the wrong thing. So the acceptance criterion has
-to be *no new swapouts*, and the fit cannot observe swap. It must therefore be conservative by construction,
-and the question is by how much and as a function of what.
+That distinction matters because a large footprint is *the point* on a dedicated machine. Two profiles fall
+out, and both are legitimate:
 
-`--fit-target` already lets a user raise the margin by hand, so nobody is stuck while this is open.
+| Profile | Slots (30B, 24 GiB Mac) | Character |
+| --- | ---: | --- |
+| Conservative | 32 | Proven no new swapouts at 40,960 context, alongside other applications |
+| Aggressive | 68 (what `auto` picks) | Loads and serves at 40,960 context; 64 slots measured **107.93 t/s** prefill |
 
-## Two explanations, and they imply different policies
+`auto` choosing 68 is not a bug. It is the right answer for a dedicated host and the wrong one for a shared
+desktop, and nothing in the memory numbers tells the fit which it is on.
 
-This is the part to settle before writing code.
+## Why swapping *while paging* is worse than swapping normally
 
-**A. Page-cache competition.** With `--load-mode none` the model file is streamed through the page cache,
-which on a unified-memory host contends with everything else. A prefill moved 1.16 TiB of expert bytes, so
-the cache is under continuous pressure to hold as much of the file as it can. If this is the mechanism, the
-margin should scale with **model file size or read volume**, and a small machine running a large model needs
-a proportionally larger reserve.
+Worth stating because it is the reason sustained churn is disqualifying rather than merely slow. The pools
+exist to cache expert weights read from disk. If the OS pages those pools out, it is writing to disk the very
+data we are reading from disk to avoid reading it from disk. Under sustained pressure that is a doom loop,
+and throughput collapses rather than degrading gracefully. One-time displacement of *other* processes' idle
+pages has none of that character.
 
-**B. Device-reported free memory over-states what is usable.** At 64 slots the pools alone are roughly
-13.3 GiB; adding KV at 40,960 tokens (3.8 GiB, at the measured 96 MiB per 1,024 tokens) plus compute and host
-allocations gives ~17.5 GiB of *anonymous* memory on a 24 GiB machine. The OS needs several GiB of that for
-itself. If this is the mechanism, page cache is a red herring, the reserve should scale with **total device
-memory**, and the 31 % that passed is roughly the right shape.
+## What the measurements actually show
 
-These are not exotic alternatives — they predict different things and the data we asked for separates them:
+**Device-reported free memory over-states what is usable.** `auto` sized to a budget of 17,061 MiB and landed
+at 17,060 MiB — the arithmetic was exact. But Metal reported roughly **18,085 MiB free on a 24,576 MiB
+machine that already had 2,653 MiB in swap**. The number the fit is handed does not reserve for the host's
+own needs, and on unified memory there is no second pool to fall back on.
 
-- If the safe threshold tracks **total memory** (~31 % regardless of model), B is dominant → reserve a
-  fraction of device total.
-- If it tracks **file size or bytes read**, A is dominant → reserve a function of the model, and a 45 GiB
-  model on the same host needs more headroom than a 25 GiB one.
-- If both matter, the reserve is `max(fraction_of_total, f(file_size))`, and we will have the two points
-  needed to fit it.
+**Read volume matters too, separately from the static allocation.** A 64-slot `pp8192` run swapped ~2.85 GiB
+with a *smaller* context than the 68-slot run. Static allocation alone does not explain that; streaming 1.16
+TiB of expert bytes through the page cache does.
 
-## The measurement that decides it
+So both mechanisms this document originally posed as alternatives are real, and a single constant fitted to
+one host would encode neither.
 
-Requested from the Mac on tip `2db74dae4`: run `--moe-n-slots auto` on the 30B at 40,960 context, and report
-the chosen count, the breakdown, whether swap moved, and **how much free memory remained**. Then the same on
-Qwen3-Coder-Next 80B-A3B, which is 45 GiB of file against the 30B's 25 GiB on the same host — that pair
-varies file size while holding the machine constant, which is exactly the discriminator between A and B.
+## Design direction
 
-Until those land, any constant written into the code is invented precision.
+- **Do not invent a constant.** The control already exists: `--fit-target` raises the reserve and is
+  respected by the sizing arithmetic unchanged.
+- **Apply any default reserve only when paging is active.** A non-paged model does not stream a file through
+  the page cache and should not pay for it.
+- **Default conservatively, let dedicated hosts opt into more.** A default that swaps a mixed desktop is a
+  worse failure than one that leaves performance unclaimed, because the second is visible and tunable while
+  the first looks like the machine is broken.
+- **Log the reserve next to the chosen count.** When a host swaps anyway, the first question is which term
+  was too small; that should be answerable from the log.
+- Consider naming the profiles rather than exposing a byte count, since "dedicated machine" and "shared
+  desktop" are the decision a user can actually make. Do not build this until the qualification below says
+  what the two settings should be.
 
-## Design sketch, to be confirmed by the above
+## The qualification that decides it
 
-- The reserve applies **only when paging is active**. A non-paged model does not stream a file through the
-  cache and should not pay for it.
-- Express it as an additional term in the existing per-device `margins`, so `--fit-target` continues to
-  override and the fit's arithmetic is untouched.
-- Log the chosen slot count *and* the reserve that produced it. When a user's machine swaps anyway, the
-  first question is which term was too small, and that should be answerable from the log rather than by
-  rebuilding.
-- Prefer under-using memory to swapping. Swap on a paged model is pathological: the OS pages out the pools
-  we are using to cache experts we are paging in from disk. Losing a few slots costs a fraction of prefill;
-  swapping costs everything.
+Not another synthetic no-swap gate. A real Claude Code session on a dedicated host at `auto`, with unrelated
+applications closed, measuring:
+
+1. startup and repository-context time to first token;
+2. sustained generation speed and tool-call correctness;
+3. **whether swapout activity stops after warmup or continues during work** — the distinction this whole
+   document turns on;
+4. system responsiveness and memory-pressure state during a multi-step agent task;
+5. behaviour at the real 40,960-token context ceiling.
+
+If swapouts stop after warmup, `auto`'s current aggressiveness is right for a dedicated host and the work is
+to expose the choice. If they continue, the reserve needs to grow and (3) tells us by how much.
 
 ## Verification
 
-- The Mac's own failure case: `auto` on the 30B at 40,960 context on the 24 GiB host must produce **zero new
-  swapouts**. Swap counters are the evidence, not the projection agreeing with itself.
-- The same on the 80B-A3B, where the file is 45 GiB — if the reserve is a function of total memory only, this
-  is where that assumption breaks.
-- A large-memory host must not be penalised into a needlessly small pool; check the chosen count against what
-  a hand search finds on the development box.
-- An explicit `--fit-target` still overrides in both directions.
+- The chosen count and the reserve that produced it appear in the log at default verbosity.
+- A large-memory host is not penalised into a needlessly small pool — check against a hand search where
+  memory is plentiful.
+- `--fit-target` overrides in both directions, and an explicit `--moe-n-slots N` is still never touched.
+- Whatever default is chosen is re-checked on both the 25 GiB and 45 GiB models on the same host, since read
+  volume is now known to matter independently of the static footprint.
 
 ## Risks
 
 | Risk | Handling |
 | --- | --- |
-| Encoding a constant fitted to one host | Do not; wait for the second model on the same machine |
-| Over-reserving and wasting a large machine's memory | Verify the chosen count against a hand search where memory is plentiful |
-| Under-reserving and swapping | Bias toward under-use; the cost is asymmetric and swap is pathological here |
-| Mechanism A and B confounded in one number | The 25 GiB vs 45 GiB pair on one host separates them |
+| Encoding a constant fitted to one host and one model | Wait for the qualification run; two models on one host at minimum |
+| A default that quietly swaps a shared desktop | Default conservatively; unclaimed performance is visible and tunable, a thrashing machine is not |
+| Treating any swap as failure and under-using a dedicated machine | The criterion is sustained churn, not the swap counter |
+| Profiles becoming another knob nobody understands | Only add them if the qualification shows two genuinely different good answers |
