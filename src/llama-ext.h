@@ -83,7 +83,15 @@ struct llama_device_memory_data {
 // TODO: convert to C-style data structure
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
-LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert     (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
+
+// Smallest expert slot count whose groups fit the graph node budget at this microbatch.
+//
+// The expert path runs in groups of n_slots/n_expert_used tokens, so a SMALLER slot count means MORE groups
+// and a larger graph - the budget is a lower bound on the slot count, moving opposite to the memory bound.
+// Returns 0 when no slot count can satisfy it, which means the microbatch itself is too large.
+LLAMA_API int32_t llama_moe_min_slots_for_graph(int32_t n_expert_used, int32_t n_layer, int32_t n_ubatch);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

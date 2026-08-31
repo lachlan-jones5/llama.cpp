@@ -34,7 +34,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        uint32_t * hp_n_expert_used = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -142,6 +143,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+    if (hp_n_expert_used) {
+        *hp_n_expert_used = llama_model_n_expert_used(model);
+    }
 
     common_memory_breakdown_print(ctx);
 
@@ -190,6 +194,16 @@ static void common_params_fit_impl(
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    uint32_t hp_neu = 0; // hparams.n_expert_used
+
+    // --moe-n-slots auto means "page, and let this function pick the count". Measure unpaged first: if the
+    // model fits as it is, paging would only cost throughput, so the sentinel resolves to off. The loader
+    // and every check downstream read a non-positive count as paging disabled, so the sentinel must not
+    // reach them either way.
+    const bool moe_auto = mparams->moe.n_slots == LLAMA_MOE_N_SLOTS_AUTO;
+    if (moe_auto) {
+        mparams->moe.n_slots = 0;
+    }
 
     // with non-unified kv, we need to take into account n_streams
     // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
@@ -260,7 +274,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &hp_neu);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -368,6 +382,96 @@ static void common_params_fit_impl(
             }
         }
     }
+
+    // step 1.5: the model does not fit as it is. If the caller asked for automatic expert paging, size the
+    // pool now, before the context is reduced - paging expert weights is the cheaper way to free memory, and
+    // the context is what a user most wants to keep. Reaching here already means the unpaged model does not
+    // fit, so paging is worth its overhead; had it fit, step 1 would have returned and left paging off.
+    if (moe_auto && hp_nex > 0 && hp_neu > 0 && hp_neu < hp_nex) {
+        // Pools are exactly linear in the slot count, so two probes give the per-slot cost per device
+        // including any alignment. Measuring beats deriving it from the on-disk expert stride, which is not
+        // the same as the pool's slot stride.
+        // The floor is not just one token's worth: a small slot count means a small group, and enough groups
+        // exceed the graph node budget. Probing below that floor would fail to build a context for a reason
+        // that has nothing to do with memory.
+        const int32_t n_graph_min = llama_moe_min_slots_for_graph(
+                (int32_t) hp_neu, (int32_t) hp_ngl, (int32_t) cparams->n_ubatch);
+        const int32_t n_slots_min = std::max((int32_t) hp_neu, n_graph_min);
+
+        const int32_t n_probe_a = n_slots_min;
+        const int32_t n_probe_b = (int32_t) std::min<int64_t>(2*(int64_t) n_slots_min, hp_nex);
+
+        auto used_per_dev = [&](int32_t n_slots) {
+            mparams->moe.n_slots = n_slots;
+            const dmds_t d = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            std::vector<int64_t> used;
+            if (nd == 0) {
+                used.push_back(d.back().mb.total());
+            } else {
+                for (size_t id = 0; id < nd; id++) {
+                    used.push_back(d[id].mb.total());
+                }
+            }
+            return used;
+        };
+
+        int32_t n_slots_fit = 0;
+
+        if (n_graph_min == 0) {
+            LOG_WRN("%s: microbatch %u is too large for expert paging at any slot count\n",
+                __func__, cparams->n_ubatch);
+        } else if (n_probe_b > n_probe_a) {
+            const std::vector<int64_t> used_a = used_per_dev(n_probe_a);
+            const std::vector<int64_t> used_b = used_per_dev(n_probe_b);
+
+            n_slots_fit = (int32_t) hp_nex;
+
+            for (size_t id = 0; id < used_a.size(); id++) {
+                const int64_t per_slot = (used_b[id] - used_a[id]) / (n_probe_b - n_probe_a);
+                const int64_t budget   = (nd == 0 ? dmds_full.back().total : dmds_full[id].free) - margins[id];
+
+                if (per_slot <= 0) {
+                    continue; // no pool on this device, so the slot count does not constrain it
+                }
+
+                const int64_t room = budget - used_a[id];
+                const int64_t here = room < 0 ? 0 : n_probe_a + room/per_slot;
+
+                n_slots_fit = (int32_t) std::min<int64_t>(n_slots_fit, here);
+            }
+        }
+
+        // A slot count at or above n_expert holds every expert, which is what not paging does but with the
+        // grouped-execution overhead on top - measured at 3.4x on a fully hot pool. Leave paging off and let
+        // the later steps free memory some other way.
+        if (n_slots_fit >= (int32_t) hp_nex) {
+            LOG_TRC("%s: %d slots would hold all %u experts, so expert paging would only add overhead\n",
+                __func__, n_slots_fit, hp_nex);
+            n_slots_fit = 0;
+        }
+
+        if (n_slots_fit < n_slots_min) {
+            if (n_slots_fit != 0) {
+                LOG_WRN("%s: expert paging cannot be sized here: %d slots fit in memory but %d are needed "
+                    "(%u for one token, %d for the graph budget at microbatch %u)\n",
+                    __func__, n_slots_fit, n_slots_min, hp_neu, n_graph_min, cparams->n_ubatch);
+            }
+            n_slots_fit = 0;
+        }
+
+        mparams->moe.n_slots = n_slots_fit;
+
+        if (n_slots_fit > 0) {
+            LOG_INF("%s: expert paging enabled with %d of %u slots per layer\n", __func__, n_slots_fit, hp_nex);
+        }
+
+        // re-measure with whatever was decided, so the steps below see the real numbers
+        dmds_full = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_full);
+    }
+
 
     // step 2: try reducing memory use by reducing the context size
 

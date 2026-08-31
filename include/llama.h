@@ -315,8 +315,14 @@ extern "C" {
     // Instead of keeping all of a layer's experts resident, keep n_slots of them and read the rest from the
     // model file as the router selects them. This trades throughput for a much smaller footprint, and only
     // helps when the model does not fit but its working set does. Disabled unless n_slots is set.
+    // n_slots value asking the fit pass to size the expert pool itself
+    #define LLAMA_MOE_N_SLOTS_AUTO (-1)
+
     struct llama_moe_params {
-        int32_t n_slots;        // resident expert slots per paged layer (0 disables expert paging)
+        // Resident expert slots per paged layer. 0 disables expert paging; LLAMA_MOE_N_SLOTS_AUTO asks the
+        // fit pass to choose the largest count the memory budget allows, and must be resolved to a concrete
+        // value before the model is loaded.
+        int32_t n_slots;
         int32_t n_layers;       // number of leading MoE layers to page (0 = every MoE layer)
         int32_t n_read_threads; // threads used to read experts (0 = pick a default)
 

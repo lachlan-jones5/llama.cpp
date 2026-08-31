@@ -2810,14 +2810,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-n-slots"}, "N",
         "keep only N experts of each paged MoE layer resident, reading the rest from the model file on demand (default: 0, disabled)\n"
         "trades throughput for memory, so it only helps when the model does not fit but its working set does\n"
+        "'auto' pages, and lets the fit pass pick the largest count that fits the memory budget - the choice\n"
+        "matters a great deal, since more slots means both a bigger cache and fewer expert groups per batch\n"
         "N must be at least n_expert_used: the expert path runs in groups of N/n_expert_used tokens, so the\n"
         "microbatch is not what N bounds, but a very small N with a large --ubatch-size needs one group per\n"
         "token and can exceed the graph node budget",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe.n_slots = LLAMA_MOE_N_SLOTS_AUTO;
+                return;
+            }
+            int n = 0;
+            try {
+                n = std::stoi(value);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("expected a slot count or 'auto'");
+            }
+            if (n < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe.n_slots = value;
+            params.moe.n_slots = n;
         }
     ).set_env("LLAMA_ARG_MOE_N_SLOTS"));
     add_opt(common_arg(

@@ -1,5 +1,7 @@
 #include "llama-moe-residency.h"
 
+#include "llama-ext.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -81,6 +83,31 @@ int32_t llama_moe_min_slots(int32_t n_expert, int32_t n_expert_used, int32_t n_u
     const int64_t needed = (int64_t) n_expert_used * (int64_t) n_ubatch;
 
     return (int32_t) std::min<int64_t>(needed, n_expert);
+}
+
+// Mirrors the budget arithmetic in llama_context::graph_max_nodes, solved for the slot count instead of
+// evaluated for one. Kept beside LLAMA_MOE_MAX_GRAPH_NODES so the two cannot drift apart.
+int32_t llama_moe_min_slots_for_graph(int32_t n_expert_used, int32_t n_layer, int32_t n_ubatch) {
+    if (n_expert_used <= 0 || n_layer <= 0 || n_ubatch <= 0) {
+        return 0;
+    }
+
+    // per-layer allowance for one group's expert region, as used by the budget
+    const int64_t n_moe_nodes = 64 + 4*(int64_t) n_expert_used;
+
+    const int64_t budget = (int64_t) LLAMA_MOE_MAX_GRAPH_NODES - 8*(int64_t) n_ubatch;
+    if (budget <= 0) {
+        return 0;
+    }
+
+    const int64_t n_groups_max = budget / (n_moe_nodes * (int64_t) n_layer);
+    if (n_groups_max <= 0) {
+        return 0;
+    }
+
+    const int64_t chunk = (n_ubatch + n_groups_max - 1) / n_groups_max;
+
+    return (int32_t) (chunk * (int64_t) n_expert_used);
 }
 
 llama_moe_status llama_moe_layer_cache::init(int32_t il, int32_t n_expert, int32_t n_slots) {

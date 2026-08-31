@@ -326,6 +326,19 @@ static void llama_moe_validate_params(const llama_model_params & params, const l
         return;
     }
 
+    // The sentinel means "the fit pass picks a number", so reaching model load still holding it means the
+    // fit never ran. Say so: every path below treats a negative count as paging-off, which would silently
+    // load the model unpaged and very likely not fit.
+    if (moe.n_slots == LLAMA_MOE_N_SLOTS_AUTO) {
+        throw std::runtime_error(
+            "--moe-n-slots auto needs the fit pass to choose a count, but it did not run. "
+            "Either allow the fit to run, or pass an explicit slot count.");
+    }
+
+    if (moe.n_slots < 0) {
+        throw std::runtime_error(format("--moe-n-slots (%d) is negative", moe.n_slots));
+    }
+
     const auto & hparams = model.hparams;
 
     const uint32_t n_expert      = hparams.n_expert;
