@@ -23,9 +23,14 @@ charged to the fitter (MTL0 model 2418 MiB at 8 slots against 6670 at 32), the g
 exact microbatch, and eviction by frequency left every output byte-identical. Measurements from both runs are
 recorded in `moe-expert-residency.md`.
 
-**Unvalidated on Metal as of the next tip:** `--moe-overlap-reads`, which is off by default because it is a
-clear loss on CUDA. Metal is the one backend where it might pay, so it needs an A/B rather than an
-assumption.
+**Also measured at `b8bd4f474` and then removed:** the deferred down-projection read. It cost 14-22 % on
+Metal at 16 and 32 slots, for the same reason it cost 11-17 % on CUDA — two extra graph splits per paged
+layer — and the code is gone. Do not test `--moe-overlap-reads`; it no longer exists. The reasoning is kept
+in `moe-expert-residency.md` so it is not rebuilt.
+
+That run also caught a build regression this checklist is the reason we know about: adding a field to
+`llama_moe_params` broke two positional aggregate initialisers, which only fails under
+`LLAMA_FATAL_WARNINGS=ON`. **Build with that flag before sending a tip**, not after.
 
 ## What to expect
 
