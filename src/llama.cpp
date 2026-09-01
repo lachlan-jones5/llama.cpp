@@ -431,6 +431,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         ml.lazy_mode = params.lazy_mode;
         ml.moe       = params.moe;
 
+        // Expert paging and mmap do not mix, and on Metal the combination is fatal rather than merely
+        // wasteful. A paged tensor gets metadata but no storage, yet the mmap path registers the whole file
+        // span covering a context's tensors as one backend buffer - and since non-expert tensors are spread
+        // through the file, that span is effectively the entire model. On Metal that means the device is
+        // handed the whole shard as a mapped resource: a 155 GiB model against an 18 GiB working set, which
+        // fails at the first decode with an out-of-memory command buffer while most of host memory sits free.
+        //
+        // Even where it does not fail it is a pure loss: the whole file is mapped either way and the slot
+        // pools are simply added on top, which measures as higher peak memory than not paging at all.
+        if (params.moe.n_slots > 0 && ml.use_mmap) {
+            if (params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+                // 'auto' means the caller had no opinion, so pick the one that works rather than refusing
+                LLAMA_LOG_INFO("%s: expert paging is enabled, loading without mmap\n", __func__);
+                ml.use_mmap = false;
+            } else {
+                throw std::runtime_error(
+                    "--moe-n-slots cannot be combined with a memory-mapped load mode: the whole model file "
+                    "would be mapped and the slot pools added on top, which costs more memory than not "
+                    "paging at all and exceeds the working set on some backends. Use --load-mode none.");
+            }
+        }
+
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 

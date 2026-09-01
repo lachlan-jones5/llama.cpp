@@ -243,10 +243,14 @@ Two things differ from the CPU picture and are worth knowing:
   compute. They are real, and they appear in the process peak; the memory breakdown accounts for them
   separately.
 
-- **Paging on top of `mmap` is a pure loss.** With the default mmap loading, the same sweep produced *higher*
-  peak RSS than full residency (15.6 GB at 8 slots against 15.1 GB resident) and lower throughput: the whole
-  file is mapped either way and the pools are simply added on top. Expert paging is worth using with
-  `--load-mode none`, where the expert bytes genuinely never enter the process.
+- **Paging never runs on top of `mmap`, because the combination does not work.** The mmap path registers the
+  span covering a context's tensors as one backend buffer, and non-expert tensors are scattered through the
+  file, so that span is effectively the whole model - the pools then sit on top of it. On CPU that measured
+  as *higher* peak RSS than not paging at all (15.6 GB at 8 slots against 15.1 GB resident). On Metal it is
+  fatal: a 151 GiB model was handed to the device as a 155 GiB mapped resource against an ~18 GiB working
+  set and failed at the first decode with an out-of-memory command buffer, while 81 % of host memory was
+  free. So `--load-mode auto` loads without mmap when paging is on, and an explicit `mmap` or `mmap+mlock`
+  is refused. Paging wants `--load-mode none`, where the expert bytes genuinely never enter the process.
 
 ### Where the remaining cost is, and where it is not
 
