@@ -127,8 +127,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
+
+        // A real file pads the row dimension, so read the count back from it rather than deriving one.
+        // A synthetically built model has no file and so no weight entry; there the head ranges are the
+        // only source of truth, and they give exactly the rows the gather can address.
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+
+        int64_t ple_rows = 0;
+        if (ple_w != nullptr) {
+            ple_rows = ple_w->tensor->ne[1];
+        } else {
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                ple_rows = std::max<int64_t>(ple_rows,
+                        (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+            }
+        }
 
         // sanity check
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
