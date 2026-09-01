@@ -42,6 +42,25 @@ There is no Metal interceptor kernel and no `MTLSharedEvent` handshake in this b
 device-side overlap optimisation, which is not implemented yet. Expect reads to be serialised against
 compute.
 
+### Tensor-parallel split does not work for qwen4exp
+
+`--split-mode tensor` is refused for `qwen4exp` with
+`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'`. That refusal is deliberate. The
+architecture gathers its per-layer embedding table through an input the scheduler carries across a graph
+split; under tensor parallelism that input lands in a buffer the meta device did not create, so it holds no
+per-device split state for it and `ggml_backend_meta_buffer_simple_tensor()` aborts. `gemma3n`, the other
+architecture with such a table, was already declared unsupported the same way. Fixing it properly is an
+upstream question, not a paging one.
+
+This is not Metal-specific — it reproduces on CUDA — and it is not about paging, which is off when it
+happens. What it means for a Mac:
+
+- Apple Silicon presents **one** Metal device however many GPU cores it has, so there is no multi-GPU Metal
+  configuration to lose. A Mac Studio or a Mac Pro is still a single Metal device.
+- `--split-mode tensor` on a Mac nevertheless builds a meta device across Metal, Accelerate and CPU, and
+  that is the path that used to abort. It now refuses instead.
+- **Layer split, the default, is unaffected.** Nothing in the normal way of running this on Metal changes.
+
 ## 1. Build
 
 ```sh

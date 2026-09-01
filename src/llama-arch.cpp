@@ -1119,6 +1119,12 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_PLAMO2:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_GEMMA3N:
+        // Like gemma3n above, qwen4exp gathers a per-layer embedding table through an input the scheduler
+        // has to carry across a graph split. Under tensor parallelism that input is allocated in a buffer
+        // the meta device did not create, so it has no per-device split state for it and
+        // ggml_backend_meta_buffer_simple_tensor() aborts. Declaring it here turns that into the ordinary
+        // "not implemented for architecture" error. Layer split is unaffected.
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_MAMBA:
         case LLM_ARCH_MAMBA2:
         case LLM_ARCH_JAMBA:
