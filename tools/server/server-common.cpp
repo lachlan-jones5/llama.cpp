@@ -84,6 +84,26 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    // Only present when expert paging is on, so responses are byte-identical without it. Without these a
+    // paged server is unmeasurable: every other tool that can page prints these counters, and the server -
+    // the one that runs a real workload rather than synthetic tokens - did not.
+    if (n_moe_lookup > 0) {
+        base["moe_n_lookup"]     = n_moe_lookup;
+        base["moe_n_hit"]        = n_moe_hit;
+        base["moe_n_miss"]       = n_moe_miss;
+        base["moe_n_evict"]      = n_moe_evict;
+        base["moe_n_read"]       = n_moe_read;
+        base["moe_n_bytes_read"] = n_moe_bytes_read;
+        base["moe_read_ms"]      = t_moe_read_ms;
+        base["moe_hit_rate"]     = (double) n_moe_hit / (double) n_moe_lookup;
+    }
+
+    if (n_moe_ple_lookup > 0) {
+        base["moe_ple_n_lookup"] = n_moe_ple_lookup;
+        base["moe_ple_n_hit"]    = n_moe_ple_hit;
+        base["moe_ple_n_miss"]   = n_moe_ple_miss;
+    }
+
     return base;
 }
 

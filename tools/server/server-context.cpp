@@ -2076,6 +2076,9 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // take the paging counters before anything else can decode on this context
+        slot.stats.moe_finish(ctx_tgt);
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3114,6 +3117,7 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        slot.stats.moe_start(ctx_tgt);
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

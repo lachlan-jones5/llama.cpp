@@ -360,6 +360,48 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // MoE expert paging, when it is enabled: what this request cost in lookups and reads.
+    //
+    // The library counters are per-context and cumulative, so these are differences taken across the
+    // request. With more than one slot in flight the requests interleave and the split between them is
+    // approximate; with --parallel 1 it is exact.
+    uint64_t n_moe_lookup     = 0;
+    uint64_t n_moe_hit        = 0;
+    uint64_t n_moe_miss       = 0;
+    uint64_t n_moe_evict      = 0;
+    uint64_t n_moe_read       = 0;
+    uint64_t n_moe_bytes_read = 0;
+    double   t_moe_read_ms    = 0.0;
+
+    // the per-layer embedding table is paged by row, with a very different access pattern; kept apart so
+    // that neither hit rate is distorted by averaging it with the other
+    uint64_t n_moe_ple_lookup = 0;
+    uint64_t n_moe_ple_hit    = 0;
+    uint64_t n_moe_ple_miss   = 0;
+
+    // snapshot of the cumulative counters when this request started
+    llama_moe_stats_data moe_base = {};
+
+    void moe_start(const llama_context * ctx) {
+        moe_base = llama_moe_stats(ctx);
+    }
+
+    void moe_finish(const llama_context * ctx) {
+        const auto now = llama_moe_stats(ctx);
+
+        n_moe_lookup     = (uint64_t) (now.n_lookup     - moe_base.n_lookup);
+        n_moe_hit        = (uint64_t) (now.n_hit        - moe_base.n_hit);
+        n_moe_miss       = (uint64_t) (now.n_miss       - moe_base.n_miss);
+        n_moe_evict      = (uint64_t) (now.n_evict      - moe_base.n_evict);
+        n_moe_read       = (uint64_t) (now.n_read       - moe_base.n_read);
+        n_moe_bytes_read = (uint64_t) (now.n_bytes_read - moe_base.n_bytes_read);
+        t_moe_read_ms    =            now.t_read_ms     - moe_base.t_read_ms;
+
+        n_moe_ple_lookup = (uint64_t) (now.n_ple_lookup - moe_base.n_ple_lookup);
+        n_moe_ple_hit    = (uint64_t) (now.n_ple_hit    - moe_base.n_ple_hit);
+        n_moe_ple_miss   = (uint64_t) (now.n_ple_miss   - moe_base.n_ple_miss);
+    }
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

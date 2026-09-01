@@ -483,6 +483,30 @@ every paged layer. Tools that print a performance summary print these alongside 
 A low hit rate means the slot count is too small for the routing pattern: either raise it, or accept that the
 model's routing is too diffuse for paging to help.
 
+`llama-server` reports the same counters per request, in the `timings` object of a completion response, as
+differences taken across that request (`moe_n_lookup`, `moe_hit_rate` and the rest). They are only present
+when paging is on. With more than one slot in flight the requests interleave and the per-request split is
+approximate; with `--parallel 1` it is exact.
+
+### Measure on real text, not on `llama-bench`
+
+**`llama-bench` feeds uniformly random token ids** (`std::rand() % n_vocab`, in both its prompt and its
+generation loop). Random ids produce out-of-distribution hidden states, the router concentrates on fewer
+experts than real text does, and the hit rate comes out flattering. Measured on Qwen3.6-35B-A3B over 2,000
+tokens at microbatch 64:
+
+| Slots | Real text (`llama-perplexity`) | Random ids (`llama-bench`) | Bytes read per token |
+| ---: | ---: | ---: | --- |
+| 32 | 67.14 % | 75.46 % | 129.2 MiB real vs 93.7 MiB random (**+37.9 %**) |
+| 40 | 71.81 % | 80.40 % | 110.8 MiB real vs 74.7 MiB random (**+48.3 %**) |
+
+So `llama-bench` overstates the hit rate by around 8.5 points and understates the bytes read by 38-48 %. It
+also overstates what more slots buy: going 32 to 40 slots cut bytes per token by 20.2 % on random ids but
+only 14.2 % on real text.
+
+Use `llama-perplexity` or `llama-server` for any number that is meant to predict real behaviour. `llama-bench`
+remains fine for A/B comparisons where both sides see the same synthetic input.
+
 Where a model has a per-layer embedding table, its counters are reported separately as row lookups, hits,
 misses and evictions. Averaging two access patterns this different into one hit rate would make both
 meaningless. Reads and bytes stay combined because there is one reader; the split is recoverable when it
