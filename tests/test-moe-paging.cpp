@@ -56,6 +56,10 @@ struct run_result {
 // Load the model with the given slot count (0 = paging off) and decode tokens, returning the logits.
 static int32_t g_n_gpu_layers = 0;
 
+// Set for models that carry a per-layer embedding table, so that a regression which quietly stops paging it
+// fails here instead of passing a comparison that no longer proves anything.
+static bool g_require_ple = false;
+
 static run_result run(const std::string & path, int32_t n_slots, uint32_t n_ubatch, bool expect_ok) {
     run_result out;
 
@@ -115,6 +119,33 @@ static run_result run(const std::string & path, int32_t n_slots, uint32_t n_ubat
         printf("  llama_decode failed with %d at %d slots\n", rc, n_slots);
     }
 
+    // Keep decoding one token at a time. The second of these reuses the graph the first built, which is the
+    // case that skips the graph-building path entirely - the inputs are set again but nothing is rebound, so
+    // a resolve that only worked on a fresh graph, or an error only checked while building one, shows up
+    // here. It also means the ids below are resolved against a warm cache rather than a cold one.
+    for (int step = 0; step < 3 && out.ok; step++) {
+        const llama_token tok = (llama_token) (((tokens.size() + step) * 7 + 1) % n_vocab);
+        const llama_pos   pos = (llama_pos) (tokens.size() + step);
+
+        common_batch_clear(batch);
+        common_batch_add(batch, tok, pos, {0}, true);
+
+        const int rc_step = llama_decode(ctx, batch);
+        if (rc_step != 0) {
+            if (expect_ok) {
+                printf("  llama_decode failed with %d at %d slots (single-token step %d)\n",
+                        rc_step, n_slots, step);
+            }
+            out.ok = false;
+            break;
+        }
+
+        const float * row = llama_get_logits_ith(ctx, 0);
+        for (uint32_t j = 0; j < n_vocab; j++) {
+            out.logits.push_back(row[j]);
+        }
+    }
+
     if (n_slots > 0 && out.ok) {
         const auto st = llama_moe_stats(ctx);
 
@@ -128,6 +159,25 @@ static run_result run(const std::string & path, int32_t n_slots, uint32_t n_ubat
         CHECK(st.n_miss > 0);
         CHECK(st.n_bytes_read > 0);
         CHECK(st.n_hit + st.n_miss == st.n_lookup);
+
+        if (g_require_ple || st.n_ple_lookup > 0) {
+            printf("             ple: lookups=%lld hits=%lld misses=%lld evictions=%lld\n",
+                    (long long) st.n_ple_lookup, (long long) st.n_ple_hit,
+                    (long long) st.n_ple_miss,   (long long) st.n_ple_evict);
+
+            // The embedding table is paged by row rather than by expert, so it has its own cache and its
+            // own counters; they must add up the same way.
+            CHECK(st.n_ple_lookup > 0);
+            CHECK(st.n_ple_miss > 0);
+            CHECK(st.n_ple_hit + st.n_ple_miss == st.n_ple_lookup);
+
+            // Several heads of one token routinely land on the same row, and consecutive tokens repeat
+            // n-grams, so a run that never hits would mean the cache is not being consulted at all.
+            CHECK(st.n_ple_hit > 0);
+
+            // The pool is sized for far more rows than this decode touches, so nothing should be displaced.
+            CHECK(st.n_ple_evict == 0);
+        }
     }
 
     llama_batch_free(batch);
@@ -148,8 +198,10 @@ int main(int argc, char ** argv) {
             slots_arg = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-ngl") == 0 || strcmp(argv[i], "--n-gpu-layers") == 0) && i + 1 < argc) {
             g_n_gpu_layers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--require-ple") == 0) {
+            g_require_ple = true;
         } else {
-            printf("usage: %s -m <model.gguf> [--slots N] [-ngl N]\n", argv[0]);
+            printf("usage: %s -m <model.gguf> [--slots N] [-ngl N] [--require-ple]\n", argv[0]);
             return 1;
         }
     }

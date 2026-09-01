@@ -309,7 +309,8 @@ struct llama_moe_resolve_ctx {
 struct llama_moe_residency {
     llama_moe_status init(const llama_moe_params & params,
                           const std::unordered_map<std::string, llama_moe_tensor_info> & paged,
-                          int32_t n_expert_used);
+                          int32_t n_expert_used,
+                          int32_t n_ple_rows = 0);
 
     // register the model file(s) the experts are read from
     llama_moe_status add_file(int fd, uint64_t size, size_t * idx);
@@ -323,6 +324,19 @@ struct llama_moe_residency {
 
     // true if this layer has anything paged
     bool is_paged_layer(int32_t il) const;
+
+    // The per-layer embedding table is paged by row rather than by expert, so it gets its own pool and its
+    // own cache. It differs from the expert path in the way that matters most: its ids are computed on the
+    // host before the graph runs, so resolving them needs no custom op, no graph split and no device
+    // round trip - the caller simply resolves before writing the ids it was going to write anyway.
+    ggml_tensor * bind_ple_pool(const ggml_tensor * orig, ggml_backend_buffer_type_t buft);
+
+    // Map row ids onto slot indices, reading in whatever is missing. ids and out_slots may be the same
+    // array. Safe to call when PLE is not paged, in which case it leaves out_slots holding the ids
+    // unchanged, so the caller needs no second code path.
+    llama_moe_status resolve_ple(const int32_t * ids, int32_t n, int32_t * out_slots);
+
+    bool ple_paged() const { return !ple.pools.empty(); }
 
     // Bring the experts that ids refers to into slots and write the slot indices to out_slots.
     // ids and out_slots both hold n entries. Runs the policy, then the reads.
@@ -363,14 +377,31 @@ struct llama_moe_residency {
     // not the microbatch - is what the slot count bounds.
     int32_t chunk_size() const { return chunk; }
 
+    // per-row statistics for the embedding table; kept apart from the expert counters so that mixing two
+    // very different access patterns does not quietly distort either hit rate
+    llama_moe_layer_stats ple_stats() const { return ple.cache.stats(); }
+
 private:
     void latch(llama_moe_status status, std::string detail);
+
+    // Shared body of bind_pool() and bind_ple_pool(). by_row picks how the pool is shaped: experts stack
+    // along ne[2] of a 3-D pool, embedding rows along ne[1] of a 2-D one.
+    ggml_tensor * bind_pool_in(llama_moe_layer & layer, const ggml_tensor * orig,
+                               ggml_backend_buffer_type_t buft, bool by_row);
+
+    // Shared body of resolve() and resolve_ple(). il only labels the error; it is negative for the
+    // embedding table, which belongs to no layer.
+    llama_moe_status resolve_in(llama_moe_layer & layer, int32_t il,
+                                const int32_t * ids, int32_t n, int32_t * out_slots);
 
     int32_t n_slots = 0;
     int32_t chunk   = 1;
 
     // indexed by layer; layers that are not paged are left empty
     std::vector<llama_moe_layer> layers;
+
+    // the per-layer embedding table: one tensor, so one pool, outside the per-layer vector
+    llama_moe_layer ple;
 
     // disk location of every paged tensor, needed when a pool is bound during graph build
     std::unordered_map<std::string, llama_moe_tensor_info> paged_info;

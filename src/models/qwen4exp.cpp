@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-residency.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -979,7 +980,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx,
+                        llama_moe_residency * moe_res) : pmodel(pmodel), mctx(mctx), moe_res(moe_res) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -995,6 +997,9 @@ public:
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
+
+    // null unless the table is paged, in which case the row ids written below are slot ids
+    llama_moe_residency * moe_res;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -1060,6 +1065,17 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // When the table is paged the gather reads a bounded pool, so the ids have to name slots rather than
+    // rows. This is where the paged rows are read in - resolving here rather than inside the graph is what
+    // keeps the embedding path free of the custom op, graph split and device round trip the expert path
+    // needs, and it costs nothing extra because the ids were being computed on the host anyway.
+    //
+    // A failure is latched in the residency manager and aborts the decode once the graph finishes; it
+    // leaves every id pointing at slot 0, so nothing here can gather out of bounds in the meantime.
+    if (moe_res != nullptr) {
+        moe_res->resolve_ple(idx.data(), (int32_t) idx.size(), idx.data());
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -1116,8 +1132,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
+    // The table is the largest tensor in the model by a wide margin and is read a handful of small rows
+    // at a time, so it is a paging target in its own right. bind_ple_pool() returns null when it is not
+    // paged, and then everything below reads the resident tensor exactly as before.
+    ggml_tensor * table = model.per_layer_tok_embd;
+
+    if (moe_res != nullptr) {
+        // Follow the token embeddings: the two are placed by the same policy and read at the same points
+        // in the graph, so the pool lands on the device the gather would have run on anyway.
+        ggml_backend_buffer_type_t buft = model.tok_embd != nullptr && model.tok_embd->buffer != nullptr
+            ? ggml_backend_buffer_get_type(model.tok_embd->buffer)
+            : nullptr;
+
+        ggml_tensor * pool = moe_res->bind_ple_pool(table, buft);
+        if (pool != nullptr) {
+            table = pool;
+        }
+    }
+
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn(),
+            table != model.per_layer_tok_embd ? moe_res : nullptr);
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
@@ -1125,7 +1160,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

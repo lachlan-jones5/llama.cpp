@@ -445,6 +445,36 @@ out-of-range expert id, a truncated file or a failed read all fail the decode wi
 an abort, never a silent fallback to a different slot count or backend, and never a partially filled slot
 presented as valid.
 
+### The per-layer embedding table
+
+Some architectures - Qwen4exp and Gemma4 among them - carry a `per_layer_token_embd.weight` table that each
+token gathers a handful of rows from. It is not an expert tensor, but it has the same shape of access, and on
+the models that have one it is the single largest tensor there is: 27,466 MiB against a working set of well
+under a megabyte per microbatch. When paging is enabled it is paged too, by row, with no separate flag.
+
+Two things make it much cheaper to page than experts:
+
+- **The row ids are computed on the host.** They come out of an n-gram hash of the token and its
+  predecessors, so they are known before the graph runs. Resolving them means remapping an array the model
+  was already building - no custom operation, no graph split, and none of the device round trip that makes
+  the expert path expensive.
+- **The rows are tiny.** A Q4_0 row of 160 values is 90 bytes, and a model with `ngram 3` and 8 heads per
+  n-gram gathers 16 of them per token. A microbatch of 512 tokens touches at most 8,192 distinct rows, or
+  0.7 MiB.
+
+The pool is sized from the microbatch and is not a user-facing knob: it holds one microbatch worth of ids
+plus 65,536 rows of headroom, a few MiB in total.
+
+The residency map adapts to the id space. A MoE layer has a few hundred experts, so the map is an array
+indexed by expert id and a use count is kept for every one of them, surviving eviction. An embedding table
+has hundreds of millions of rows, where those arrays would cost gigabytes of host memory to manage a pool of
+a few thousand slots, so above a million ids residency moves into a hash map holding only what is resident
+and use counts are kept per slot instead - which means they start over on admission rather than surviving
+eviction. Hashed n-gram rows turn over far too fast for that history to have been worth paying for.
+
+Because the table is one tensor rather than one per block, paging it is all-or-nothing: `--moe-n-layers`
+bounds which layers page their experts and does not affect it.
+
 ## Statistics
 
 `llama_moe_stats()` reports lookups, hits, misses, evictions, reads, bytes read and read time, summed over
@@ -452,6 +482,11 @@ every paged layer. Tools that print a performance summary print these alongside 
 
 A low hit rate means the slot count is too small for the routing pattern: either raise it, or accept that the
 model's routing is too diffuse for paging to help.
+
+Where a model has a per-layer embedding table, its counters are reported separately as row lookups, hits,
+misses and evictions. Averaging two access patterns this different into one hit rate would make both
+meaningless. Reads and bytes stay combined because there is one reader; the split is recoverable when it
+matters, since the table has a single pool and so reads exactly once per row miss.
 
 ### Routing traces
 
@@ -467,5 +502,10 @@ Tracing is off unless the variable is set, and costs one null check per resolve 
 
 - `test-moe-residency` - the admission policy and the read path, no model required.
 - `test-moe-paging` - loads a generated MoE model paged and fully resident, decodes the same tokens through
-  both and requires the logits to match exactly. Registered twice, once on CPU and once with the layers
+  both and requires the logits to match exactly. It decodes a multi-token batch and then several single
+  tokens, so the graph the first decode built is reused by a later one - the case where nothing is rebound
+  and only the inputs are set again. Registered twice per model, once on CPU and once with the layers
   offloaded, so whichever GPU backend is present is covered.
+- The same comparison runs against the generated `qwen4exp` model, which additionally pages its per-layer
+  embedding table. `--require-ple` makes it a failure for that table not to be paged, so a regression that
+  quietly stops paging it cannot pass a comparison that would then prove nothing.

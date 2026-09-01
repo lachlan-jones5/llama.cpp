@@ -1625,7 +1625,15 @@ extern "C" {
         int64_t n_evict;      // resident experts displaced to make room
         int64_t n_read;       // completed reads
         int64_t n_bytes_read; // bytes read from the model file
-        double  t_read_ms;    // wall time spent reading experts
+        double  t_read_ms;    // wall time spent reading, experts and embedding rows together
+
+        // The per-layer embedding table, where a model has one, is paged by row through the same reader
+        // but with a very different access pattern, so its counters are kept apart rather than averaged
+        // into the expert ones. Zero when the model has no such table or it is not paged.
+        int64_t n_ple_lookup;
+        int64_t n_ple_hit;
+        int64_t n_ple_miss;
+        int64_t n_ple_evict;
     };
 
     LLAMA_API struct llama_moe_stats_data llama_moe_stats      (const struct llama_context * ctx);

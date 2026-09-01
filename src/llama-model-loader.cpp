@@ -881,6 +881,19 @@ bool llama_model_loader::moe_should_page(const std::string & name, const ggml_te
         return false;
     }
 
+    // The per-layer embedding table is paged by row. It is not an expert tensor, but it has the same shape
+    // of access - a gather of a few ids per token out of something enormous - and it is the single largest
+    // tensor in the models that carry it: 27 GiB against a working set under a megabyte per microbatch.
+    if (name == "per_layer_token_embd.weight") {
+        if (cur->ne[1] <= 1) {
+            return false;
+        }
+        if (il_out) {
+            *il_out = -1;  // not a layer tensor
+        }
+        return true;
+    }
+
     // Only the routed expert weight matrices are paged. The per-expert biases and scales that share this
     // base name are tiny and stay resident, and they are indexed by expert id rather than by slot, so
     // paging them would be wrong as well as pointless.
@@ -1370,16 +1383,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 tensor = ggml_dup_tensor(ctx_moe.get(), cur);
                 ggml_set_name(tensor, tn.str().c_str());
 
+                // An expert tensor stacks experts on ne[2]; the embedding table stacks rows on ne[1].
+                // Both are "n items of stride bytes", which is all the reader and the pool need.
+                const bool by_row = il < 0;
+
                 moe_paged[tn.str()] = {
                     /*.file_idx =*/ w.idx,
                     /*.offset   =*/ w.offs,
-                    /*.stride   =*/ cur->nb[2],
-                    /*.n_expert =*/ (int32_t) cur->ne[2],
+                    /*.stride   =*/ by_row ? cur->nb[1]           : cur->nb[2],
+                    /*.n_expert =*/ by_row ? (int32_t) cur->ne[1] : (int32_t) cur->ne[2],
                     /*.il       =*/ il,
                 };
 
-                LLAMA_LOG_DEBUG("%s: tensor %s (%d experts of %zu KiB) will be paged\n",
-                        __func__, tn.str().c_str(), (int32_t) cur->ne[2], (size_t) cur->nb[2]/1024);
+                LLAMA_LOG_DEBUG("%s: tensor %s (%d %s of %zu bytes) will be paged\n",
+                        __func__, tn.str().c_str(),
+                        by_row ? (int32_t) cur->ne[1] : (int32_t) cur->ne[2],
+                        by_row ? "rows" : "experts",
+                        (size_t) (by_row ? cur->nb[1] : cur->nb[2]));
             }
 
             if (!(flags & TENSOR_DUPLICATED)) {

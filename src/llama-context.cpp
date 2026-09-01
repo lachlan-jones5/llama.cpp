@@ -368,8 +368,14 @@ llama_context::llama_context(
         if (model.moe_params().n_slots > 0 && !model.moe_paged.empty()) {
             moe_res = std::make_unique<llama_moe_residency>();
 
+            // Rows the embedding-table pool must hold, when the model has one. A resolve pins everything it
+            // touches, so the floor is one microbatch worth of ids; past that the pool is just a cache, and
+            // at ~90 bytes a row the headroom below is a few MiB against a table of tens of GiB.
+            const uint32_t n_ple_tokens = std::max(cparams.n_ubatch, cparams.n_seq_max);
+            const int32_t  n_ple_rows   = (int32_t) (model.hparams.ple_n_heads * n_ple_tokens + 65536);
+
             llama_moe_status status = moe_res->init(model.moe_params(), model.moe_paged,
-                    (int32_t) model.hparams.n_expert_used);
+                    (int32_t) model.hparams.n_expert_used, n_ple_rows);
 
             for (size_t i = 0; i < model.moe_files.size() && status == LLAMA_MOE_STATUS_OK; i++) {
                 size_t idx = 0;
@@ -1450,7 +1456,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    // A slot pool that could not be bound leaves the graph pointing at an expert tensor with no storage.
+    // A slot pool that could not be bound leaves the graph pointing at a paged tensor with no storage, and
+    // the embedding rows are resolved from set_inputs() just above, so both are covered by checking here.
     // Checked here rather than next to the graph build so that a reused graph is covered too.
     if (moe_res && moe_res->error() != LLAMA_MOE_STATUS_OK) {
         LLAMA_LOG_ERROR("%s: MoE expert paging failed: %s (%s)\n", __func__,
@@ -4408,6 +4415,7 @@ llama_moe_stats_data llama_moe_stats(const llama_context * ctx) {
     }
 
     const auto layer = ctx->get_moe_res()->total_stats();
+    const auto ple   = ctx->get_moe_res()->ple_stats();
     const auto io    = ctx->get_moe_res()->io_stats();
 
     data.n_lookup     = (int64_t) layer.n_lookup;
@@ -4418,24 +4426,42 @@ llama_moe_stats_data llama_moe_stats(const llama_context * ctx) {
     data.n_bytes_read = (int64_t) io.n_bytes;
     data.t_read_ms    = 1e-3 * (double) io.t_read_us;
 
+    data.n_ple_lookup = (int64_t) ple.n_lookup;
+    data.n_ple_hit    = (int64_t) ple.n_hit;
+    data.n_ple_miss   = (int64_t) ple.n_miss;
+    data.n_ple_evict  = (int64_t) ple.n_evict;
+
     return data;
 }
 
 void llama_moe_stats_print(const llama_context * ctx) {
     const auto data = llama_moe_stats(ctx);
 
-    if (data.n_lookup == 0) {
+    if (data.n_lookup == 0 && data.n_ple_lookup == 0) {
         return; // paging is off, or nothing was routed through it
     }
 
-    const double hit_rate = 100.0 * (double) data.n_hit / (double) data.n_lookup;
-    const double mib      = (double) data.n_bytes_read / (1024.0*1024.0);
+    const double mib = (double) data.n_bytes_read / (1024.0*1024.0);
 
-    LLAMA_LOG_INFO("%s:  expert lookups = %10" PRId64 "\n", __func__, data.n_lookup);
-    LLAMA_LOG_INFO("%s:      cache hits = %10" PRId64 " (%6.2f %%)\n", __func__, data.n_hit, hit_rate);
-    LLAMA_LOG_INFO("%s:    cache misses = %10" PRId64 "\n", __func__, data.n_miss);
-    LLAMA_LOG_INFO("%s:      evictions  = %10" PRId64 "\n", __func__, data.n_evict);
-    LLAMA_LOG_INFO("%s:      expert reads = %8" PRId64 " (%8.2f MiB)\n", __func__, data.n_read, mib);
+    if (data.n_lookup > 0) {
+        const double hit_rate = 100.0 * (double) data.n_hit / (double) data.n_lookup;
+
+        LLAMA_LOG_INFO("%s:  expert lookups = %10" PRId64 "\n", __func__, data.n_lookup);
+        LLAMA_LOG_INFO("%s:      cache hits = %10" PRId64 " (%6.2f %%)\n", __func__, data.n_hit, hit_rate);
+        LLAMA_LOG_INFO("%s:    cache misses = %10" PRId64 "\n", __func__, data.n_miss);
+        LLAMA_LOG_INFO("%s:      evictions  = %10" PRId64 "\n", __func__, data.n_evict);
+    }
+
+    if (data.n_ple_lookup > 0) {
+        const double hit_rate = 100.0 * (double) data.n_ple_hit / (double) data.n_ple_lookup;
+
+        LLAMA_LOG_INFO("%s:     row lookups = %10" PRId64 "\n", __func__, data.n_ple_lookup);
+        LLAMA_LOG_INFO("%s:      cache hits = %10" PRId64 " (%6.2f %%)\n", __func__, data.n_ple_hit, hit_rate);
+        LLAMA_LOG_INFO("%s:    cache misses = %10" PRId64 "\n", __func__, data.n_ple_miss);
+        LLAMA_LOG_INFO("%s:      evictions  = %10" PRId64 "\n", __func__, data.n_ple_evict);
+    }
+
+    LLAMA_LOG_INFO("%s:           reads = %10" PRId64 " (%8.2f MiB)\n", __func__, data.n_read, mib);
 
     if (data.t_read_ms > 0.0) {
         LLAMA_LOG_INFO("%s:       read time = %10.2f ms (%8.2f MiB/s)\n",

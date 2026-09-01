@@ -231,6 +231,24 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-paging-gpu PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # qwen4exp additionally pages its per-layer embedding table by row, which is a different id space and a
+    # different tensor rank from the expert path, so it gets its own comparison
+    llama_test(
+        test-moe-paging
+        NAME test-moe-paging-ple
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --require-ple
+    )
+    set_tests_properties(test-moe-paging-ple PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_test(
+        test-moe-paging
+        NAME test-moe-paging-ple-gpu
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --require-ple -ngl 99
+    )
+    set_tests_properties(test-moe-paging-ple-gpu PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
