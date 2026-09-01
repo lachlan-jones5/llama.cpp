@@ -247,6 +247,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
 
+    // qwen4exp per-layer-embedding shape, kept tiny but structurally faithful
+    const uint32_t ple_ngram_size      = 3;
+    const uint32_t ple_heads_per_ngram = 2;
+    const uint32_t ple_n_heads         = (ple_ngram_size - 1) * ple_heads_per_ngram;
+    // build_ple multiplies the gathered embedding by ple_key [n_embd, hc_dim], so the flattened heads have
+    // to come out exactly n_embd wide
+    const uint32_t ple_head_dim        = n_embd / ple_n_heads;
+    const uint32_t ple_head_vocab      = 64;
+
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
     if (arch == LLM_ARCH_QWEN4EXP) {
@@ -254,6 +263,65 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // Per-layer embeddings. Without these hparams ple_n_heads stays 0, build_inp_ple is skipped
+        // entirely, and the whole PLE path - including its per-layer tensors and the shared n-gram table -
+        // goes uncovered. The real model's table is 27 GiB of 90-byte rows; this one is the same shape in
+        // miniature so the gather, the head offsets and the row indexing are all exercised.
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,        ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,   ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,       uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,      uint32_t(2));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, ple_head_dim);
+
+        // These four go through gguf directly rather than add_kv. add_kv collapses a one-element container
+        // to a scalar, which would turn ple.layers into a value the loader's get_arr cannot read, and its
+        // container template is only instantiated for uint32 and float while the loader reads the head
+        // ranges and multipliers at uint64 width.
+        const LLM_KV kv(arch);
+
+        // The PLE module keeps a convolution history, so its layer must be one the recurrent cache covers -
+        // otherwise get_p_l() hands build_conv_state_at a null tensor. is_recr_impl marks layer i recurrent
+        // when (i + 1) % full_attention_interval != 0, and that interval is 2 above, so layer 0 qualifies
+        // and the last layer does not.
+        const std::vector<uint32_t> ple_layers  = { 0 };
+        // one multiplier per n-gram position; distinct primes so different contexts hash apart
+        const std::vector<uint64_t> ple_mults   = { 1000003ull, 1000033ull, 1000037ull };
+
+        // heads carve the table into equal, non-overlapping ranges, as the reference does
+        std::vector<uint64_t> ple_offsets;
+        std::vector<uint64_t> ple_vocabs;
+        for (uint32_t h = 0; h < ple_n_heads; ++h) {
+            ple_offsets.push_back(uint64_t(h) * ple_head_vocab);
+            ple_vocabs .push_back(ple_head_vocab);
+        }
+
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_PLE_LAYERS).c_str(),
+                GGUF_TYPE_UINT32, ple_layers.data(),  ple_layers.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(),
+                GGUF_TYPE_UINT64, ple_mults.data(),   ple_mults.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(),
+                GGUF_TYPE_UINT64, ple_offsets.data(), ple_offsets.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(),
+                GGUF_TYPE_UINT64, ple_vocabs.data(),  ple_vocabs.size());
+
+        // The table has to exist in the file before the model is built: create_tensor reads its row count
+        // back with require_weight rather than deriving it, since the real file pads the row dimension.
+        {
+            ggml_tensor t;
+            memset(&t, 0, sizeof(ggml_tensor));
+            t.type  = GGML_TYPE_F16;
+            t.ne[0] = ple_head_dim;
+            t.ne[1] = ple_n_heads * ple_head_vocab;
+            t.ne[2] = 1;
+            t.ne[3] = 1;
+            t.nb[0] = ggml_type_size(t.type);
+            t.nb[1] = ggml_row_size(t.type, t.ne[0]);
+            t.nb[2] = t.nb[1]*t.ne[1];
+            t.nb[3] = t.nb[2]*t.ne[2];
+            ggml_set_name(&t, "per_layer_token_embd.weight");
+            gguf_add_tensor(ms.gguf_ctx, &t);
+        }
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
