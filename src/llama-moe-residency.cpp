@@ -118,11 +118,21 @@ llama_moe_status llama_moe_layer_cache::init(int32_t il, int32_t n_expert, int32
     this->il    = il;
     this->n_exp = n_expert;
     this->n_slot = n_slots;
+    this->sparse = n_expert > max_dense_ids;
 
-    expert_to_slot.assign(n_expert, -1);
+    expert_to_slot.clear();
+    id_map.clear();
+
+    if (sparse) {
+        id_map.reserve((size_t) n_slots * 2);
+        use_count.assign(n_slots, 0);
+    } else {
+        expert_to_slot.assign(n_expert, -1);
+        use_count     .assign(n_expert, 0);
+    }
+
     slot_to_expert.assign(n_slots,  -1);
     lru_clock     .assign(n_slots,   0);
-    use_count     .assign(n_expert,  0);
     pinned        .assign(n_slots, false);
 
     clock = 0;
@@ -133,14 +143,43 @@ llama_moe_status llama_moe_layer_cache::init(int32_t il, int32_t n_expert, int32
 
 void llama_moe_layer_cache::invalidate() {
     std::fill(expert_to_slot.begin(), expert_to_slot.end(), -1);
+    id_map.clear();
+
     std::fill(slot_to_expert.begin(), slot_to_expert.end(), -1);
     std::fill(lru_clock.begin(),      lru_clock.end(),       0);
     std::fill(pinned.begin(),         pinned.end(),      false);
 
-    // use_count is deliberately kept: it describes how this layer routes, which is still true after the
-    // residency map is dropped, and it is what the policy needs to be any good on the next ubatch.
+    if (sparse) {
+        // the counts are keyed by slot, and every slot is empty now
+        std::fill(use_count.begin(), use_count.end(), 0);
+    }
+
+    // Otherwise use_count is deliberately kept: it describes how this layer routes, which is still true
+    // after the residency map is dropped, and it is what the policy needs to be any good on the next ubatch.
 
     clock = 0;
+}
+
+uint64_t llama_moe_layer_cache::count_of_slot(int32_t s) const {
+    const int32_t e = slot_to_expert[s];
+
+    // an empty slot costs nothing to take, so it always wins
+    if (e < 0) {
+        return 0;
+    }
+
+    return sparse ? use_count[s] : use_count[e];
+}
+
+void llama_moe_layer_cache::touch(int32_t e, int32_t s, bool fresh) {
+    if (sparse) {
+        // counts follow the slot, so an admission starts its own history
+        use_count[s] = fresh ? 1 : use_count[s] + 1;
+        return;
+    }
+
+    // dense counts follow the id and outlive its residency, so an admission just carries on where it left off
+    use_count[e]++;
 }
 
 int32_t llama_moe_layer_cache::slot_of(int32_t expert) const {
@@ -148,7 +187,7 @@ int32_t llama_moe_layer_cache::slot_of(int32_t expert) const {
         return -1;
     }
 
-    return expert_to_slot[expert];
+    return find_slot(expert);
 }
 
 int32_t llama_moe_layer_cache::expert_in(int32_t slot) const {
@@ -176,9 +215,7 @@ int32_t llama_moe_layer_cache::evict_victim() const {
             continue;
         }
 
-        const int32_t  e     = slot_to_expert[s];
-        // an empty slot costs nothing to take, so it always wins
-        const uint64_t count = e < 0 ? 0 : use_count[e];
+        const uint64_t count = count_of_slot(s);
 
         if (best < 0 || count < best_count || (count == best_count && lru_clock[s] < best_clock)) {
             best       = s;
@@ -221,11 +258,12 @@ llama_moe_status llama_moe_layer_cache::resolve(
         }
 
         st.n_lookup++;
-        use_count[e]++;
 
-        int32_t s = expert_to_slot[e];
+        int32_t s = find_slot(e);
 
-        if (s >= 0) {
+        const bool fresh = s < 0;
+
+        if (!fresh) {
             st.n_hit++;
         } else {
             s = evict_victim();
@@ -240,17 +278,29 @@ llama_moe_status llama_moe_layer_cache::resolve(
             const int32_t prev = slot_to_expert[s];
 
             if (prev >= 0) {
-                expert_to_slot[prev] = -1;
+                if (sparse) {
+                    id_map.erase(prev);
+                } else {
+                    expert_to_slot[prev] = -1;
+                }
                 st.n_evict++;
             }
 
             slot_to_expert[s] = e;
-            expert_to_slot[e] = s;
+
+            if (sparse) {
+                id_map[e] = s;
+            } else {
+                expert_to_slot[e] = s;
+            }
 
             st.n_miss++;
 
             fills.push_back({ e, s });
         }
+
+        // after admission, so a fresh slot's count starts from this use rather than the evicted id's
+        touch(e, s, fresh);
 
         lru_clock[s] = ++clock;
         pinned[s]    = true;

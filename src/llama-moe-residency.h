@@ -99,19 +99,51 @@ struct llama_moe_layer_cache {
     const llama_moe_layer_stats & stats() const { return st; }
     void reset_stats() { st = {}; }
 
+    // Above this many ids the maps below stop being kept as arrays indexed by id. A MoE layer has a few
+    // hundred experts, so an array costs a few KiB and is the fastest thing available; an embedding table
+    // has hundreds of millions of rows, where the same arrays would cost gigabytes of host memory to manage
+    // a pool of a few thousand slots - more than paging the table saves is not the point, it is simply
+    // absurd. The threshold caps the dense case at about 12 MiB.
+    static constexpr int32_t max_dense_ids = 1 << 20;
+
 private:
     // Slot to evict: the least frequently routed expert that is not pinned by the current resolve(), with
     // recency as the tiebreak. -1 if every slot is pinned.
     int32_t evict_victim() const;
 
+    // Slot holding id e, or -1. e must already be known in range - this is the innermost step of resolve(),
+    // which validates it once for the whole call.
+    int32_t find_slot(int32_t e) const {
+        if (!sparse) {
+            return expert_to_slot[e];
+        }
+
+        const auto it = id_map.find(e);
+        return it == id_map.end() ? -1 : it->second;
+    }
+
+    // How often the id in slot s has been routed, for the eviction policy.
+    uint64_t count_of_slot(int32_t s) const;
+
+    // Record one use of id e, now held in slot s. fresh is true when this call admitted it.
+    void touch(int32_t e, int32_t s, bool fresh);
+
     int32_t il    = -1;
     int32_t n_exp = 0;
     int32_t n_slot = 0;
 
-    std::vector<int32_t> expert_to_slot;  // n_exp entries, -1 when not resident
+    // Set when the id space is too large to index arrays by. Residency then lives in a hash map holding only
+    // the resident ids, and use counts are kept per slot rather than per id - so they start over on
+    // admission instead of surviving eviction. Keeping the history would mean an unbounded map over an id
+    // space of hundreds of millions, and hashed n-gram rows have far too much turnover for it to pay.
+    bool sparse = false;
+
+    std::vector<int32_t> expert_to_slot;         // dense: n_exp entries, -1 when not resident
+    std::unordered_map<int32_t, int32_t> id_map; // sparse: resident ids only, at most n_slot entries
+
     std::vector<int32_t> slot_to_expert;  // n_slot entries, -1 when empty
     std::vector<uint64_t> lru_clock;      // n_slot entries, last touch
-    std::vector<uint64_t> use_count;      // n_exp entries, times routed - survives eviction, which is the point
+    std::vector<uint64_t> use_count;      // times routed; n_exp entries when dense, n_slot when sparse
     std::vector<bool>     pinned;         // n_slot entries, in use by the current resolve()
 
     uint64_t clock = 0;

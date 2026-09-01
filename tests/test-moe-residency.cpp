@@ -129,6 +129,61 @@ static void test_repeated_id_fills_once() {
     CHECK(slots[2] == slots[3]);
 }
 
+// The per-layer embedding table has hundreds of millions of rows, so the cache cannot keep an array entry
+// per id the way it does for a few hundred experts. Everything about resolving must still behave the same;
+// what changes is that use counts follow the slot, so they start over on admission rather than surviving
+// eviction.
+static void test_large_id_space_stays_sparse() {
+    printf("test_large_id_space_stays_sparse\n");
+
+    const int32_t n_ids   = 320000000;  // the real table's order of magnitude
+    const int32_t n_slots = 64;
+
+    llama_moe_layer_cache cache;
+    CHECK(cache.init(-1, n_ids, n_slots) == LLAMA_MOE_STATUS_OK);
+
+    std::vector<int32_t>        slots;
+    std::vector<llama_moe_fill> fills;
+
+    // ids from all over the space, including the very last row
+    const int32_t last = n_ids - 1;
+
+    CHECK(run(cache, {0, 1234567, last, 1234567}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.size() == 3);          // the repeat is filled once
+    CHECK(slots[1] == slots[3]);
+    CHECK(cache.stats().n_hit == 1);
+    CHECK(cache.slot_of(last) != -1);
+    CHECK(cache.slot_of(2) == -1);
+
+    // a second ubatch finds them all resident
+    CHECK(run(cache, {0, 1234567, last}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(fills.empty());
+
+    // out-of-range is still rejected on the id, not on the map
+    CHECK(run(cache, {n_ids}, slots, fills) == LLAMA_MOE_STATUS_INVALID_EXPERT);
+
+    // Fill every slot, then push one more id in. Frequency still decides: 0 was routed twice above, the
+    // filler ids once each, so a filler goes rather than 0.
+    CHECK(cache.init(-1, n_ids, 4) == LLAMA_MOE_STATUS_OK);
+
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {0}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {100000000}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {200000000}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(run(cache, {300000000}, slots, fills) == LLAMA_MOE_STATUS_OK);
+
+    CHECK(run(cache, {123}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(cache.slot_of(0) != -1);
+    CHECK(cache.slot_of(123) != -1);
+    CHECK(cache.stats().n_evict == 1);
+
+    // invalidate drops residency and leaves the map usable
+    cache.invalidate();
+    CHECK(cache.slot_of(0) == -1);
+    CHECK(run(cache, {42}, slots, fills) == LLAMA_MOE_STATUS_OK);
+    CHECK(cache.slot_of(42) != -1);
+}
+
 static void test_lfu_eviction_order() {
     printf("test_lfu_eviction_order\n");
 
@@ -614,6 +669,7 @@ int main() {
     test_init_validation();
     test_miss_then_hit();
     test_repeated_id_fills_once();
+    test_large_id_space_stays_sparse();
     test_lfu_eviction_order();
     test_recency_breaks_frequency_ties();
     test_in_ubatch_pinning();
