@@ -470,7 +470,9 @@ indexed by expert id and a use count is kept for every one of them, surviving ev
 has hundreds of millions of rows, where those arrays would cost gigabytes of host memory to manage a pool of
 a few thousand slots, so above a million ids residency moves into a hash map holding only what is resident
 and use counts are kept per slot instead - which means they start over on admission rather than surviving
-eviction. Hashed n-gram rows turn over far too fast for that history to have been worth paying for.
+eviction. On real text a row pool of this size hits about 45 % of the time, so the residency is worth having;
+what is not worth gigabytes of host memory is remembering the frequency of the hundreds of millions of rows
+that are *not* resident.
 
 Because the table is one tensor rather than one per block, paging it is all-or-nothing: `--moe-n-layers`
 bounds which layers page their experts and does not affect it.
