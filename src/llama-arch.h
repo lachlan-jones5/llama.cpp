@@ -686,6 +686,13 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // qwen4exp: the head projects the hidden state and the token embedding separately rather than through
+    // one eh_proj over their concatenation, and collapses its hc-way residual with a mixer instead of a norm
+    LLM_TENSOR_NEXTN_FC_EMBD,
+    LLM_TENSOR_NEXTN_FC_HIDDEN,
+    LLM_TENSOR_NEXTN_HC_MIX_NORM,
+    LLM_TENSOR_NEXTN_HC_MIX_DOWN,
+    LLM_TENSOR_NEXTN_HC_MIX_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,

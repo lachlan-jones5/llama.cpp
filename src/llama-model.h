@@ -228,6 +228,14 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // qwen4exp: separate projections of the hidden state and the token embedding, and the head's own
+    // hyper-connection mixer in place of a final norm
+    struct ggml_tensor * fc_embd               = nullptr;
+    struct ggml_tensor * fc_hidden             = nullptr;
+    struct ggml_tensor * hc_mix_norm           = nullptr;
+    struct ggml_tensor * hc_mix_down           = nullptr;
+    struct ggml_tensor * hc_mix_up             = nullptr;
 };
 
 struct llama_layer_switch_lora {
