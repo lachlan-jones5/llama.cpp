@@ -1669,7 +1669,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    // MTP blocks that were not loaded leave their tensors in the file unclaimed - the block's weights are
+    // counted as skipped where the architecture asks for them, but the generic scale and bias pass above
+    // only follows tensors that exist, so a skipped block's auxiliaries are never visited. That is the
+    // one case where a file legitimately holds more than this load needs.
+    const bool skipped_mtp = !ml.load_mtp && hparams.n_layer_nextn > 0;
+    ml.done_getting_tensors(/*partial*/ skipped_mtp);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
