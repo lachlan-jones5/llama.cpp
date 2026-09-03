@@ -226,6 +226,12 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    // Width of one row of the hidden state handed to a NextN/MTP head. Most architectures feed the head
+    // the same row they feed the output head, so this defaults to n_embd_out(). Hyper-connection models
+    // (qwen4exp) feed it the whole hc_mult-way residual stream instead, which is hc_mult times wider than
+    // anything the model outputs.
+    uint32_t n_embd_nextn_impl = 0;
+
     uint32_t dflash_block_size       = 0;
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
@@ -393,6 +399,7 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
+    uint32_t n_embd_nextn() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;

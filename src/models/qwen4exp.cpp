@@ -28,6 +28,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
+    // NextN/MTP: one extra decoder block appended beyond the main stack. The head consumes the whole
+    // hc_mult-way residual stream of the last main layer, before the final mixer collapses it, so the
+    // hidden row it is handed is hc_mult times wider than the model's output.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_all");
+    hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
@@ -363,8 +370,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
-            // everything below is per token, so drop the rows that produce no output
+        // Everything below is per token, so drop the rows that produce no output - unless an MTP head is
+        // being fed unmasked, in which case it needs the residual of every token and the reduction is
+        // deferred to the output path below.
+        const bool reduce_last = il == n_layer - 1 && inp_out_ids &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+
+        if (reduce_last) {
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
@@ -391,10 +403,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
+    // What an MTP head consumes: the full hc-way residual of the last main layer, before the final mixer
+    // collapses it. One row per token, hc*n_embd wide - see n_embd_nextn().
+    {
+        ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        cb(h_nextn, "h_nextn", -1);
+        res->t_h_nextn = h_nextn;
+    }
+
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
+
+    if (inp_out_ids && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        // the rows were kept for the head above; the output path still only wants the flagged ones
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

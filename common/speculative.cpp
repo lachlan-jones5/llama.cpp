@@ -1405,8 +1405,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
-        GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
+        // The head consumes one row of the target's h_nextn per token. That is the output embedding width for
+        // most models, but a hyper-connection model hands the head its whole multi-stream residual, so ask
+        // for the nextn width specifically rather than assuming it equals n_embd_out.
+        n_embd = llama_model_n_embd_nextn(llama_get_model(ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd_nextn(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
@@ -2505,6 +2508,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+
+    // Expert paging is a property of the target model. Carried over, it makes a dense draft model refuse to
+    // load ("no routed experts"), an 'auto' count fail because the draft never goes through the fit pass,
+    // and a MoE draft page itself with the target's slot count. A draft that should page can be given its
+    // own settings when that is ever wanted; until then it stays resident.
+    result.moe = {};
 
     if (has_draft) {
         result.devices               = params_spec.devices;
