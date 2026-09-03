@@ -281,6 +281,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -361,6 +364,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+
+    if (model.layers[0].hc_attn_norm == nullptr) {
+        // a head-only file loaded without an MTP context type
+        throw std::runtime_error("this file holds only the MTP draft head; it cannot be run as a target model");
+    }
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -470,6 +478,147 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // the rows were kept for the head above; the output path still only wants the flagged ones
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head.
+//
+// The head is one more trunk layer. It is fed the trunk's pre-mixer residual - the full hc-way stream of the
+// last main layer, hc*n_embd wide - together with the token that follows, and it predicts the token after
+// that. What it does with them differs from the qwen35 head in two places its tensors make visible: the
+// hidden state and the embedding are projected separately (fc_hidden per lane, fc_embd broadcast over
+// lanes) and added, rather than through one eh_proj over their concatenation; and there is no final norm,
+// the head's own hyper-connection mixer collapses the streams exactly as the trunk's head mixer does.
+//
+// Its next hidden state - what a chained draft step is fed - is its own pre-mixer residual.
+llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, helpers_only{}) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP supports a single draft head");
+    GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+
+    const int64_t hc     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim = hc * n_embd;
+
+    // stored right after the main stack
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.fc_hidden   && layer.nextn.fc_embd && "MTP head missing its input projection");
+    GGML_ASSERT(layer.nextn.hnorm       && layer.nextn.enorm   && "MTP head missing its input norms");
+    GGML_ASSERT(layer.nextn.hc_mix_norm && layer.nextn.hc_mix_down && layer.nextn.hc_mix_up &&
+            "MTP head missing its output mixer");
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    // The driver hands the hidden rows over as batch.embd alongside the tokens, so the input carries both.
+    // Sized by the h row, which is hc times wider than anything this model outputs.
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_nextn());
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_nextn(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_nextn(), n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    GGML_ASSERT(ubatch.token && "the MTP head takes token ids; embedding input is not supported");
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    // the trunk's residual, back in its natural shape
+    ggml_tensor * h3 = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // the same hybrid memory the trunk uses, holding this block only
+    auto * inp_mem = build_inp_mem_hybrid();
+
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_mem->mctx);
+
+    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+    if (mctx_idx) {
+        GGML_ASSERT(mctx_idx->get_n_kv() == inp_mem->mctx->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+    }
+
+    // Input projection. The hidden side is normalised per lane - ggml_rms_norm reduces over ne[0], which is
+    // one stream of the [n_embd, hc, T] tensor - and scaled by the [hc_dim] gamma, then fc_hidden is applied
+    // to every lane with shared weights: laid out lane-major, the streams are just hc*T columns.
+    ggml_tensor * hn = ggml_rms_norm(ctx0, h3, hparams.f_norm_rms_eps);
+    hn = ggml_mul(ctx0, ggml_reshape_2d(ctx0, hn, hc_dim, n_tokens), layer.nextn.hnorm);
+    cb(hn, "mtp_hnorm", il);
+
+    ggml_tensor * hp = build_lora_mm(layer.nextn.fc_hidden, ggml_reshape_2d(ctx0, hn, n_embd, hc * n_tokens));
+    hp = ggml_reshape_3d(ctx0, hp, n_embd, hc, n_tokens);
+    cb(hp, "mtp_fc_hidden", il);
+
+    // the embedding side is a plain row per token, added to every lane
+    ggml_tensor * en = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(en, "mtp_enorm", il);
+
+    ggml_tensor * ep = build_lora_mm(layer.nextn.fc_embd, en);
+    ep = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ep, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    cb(ep, "mtp_fc_embd", il);
+
+    ggml_tensor * res_hc = ggml_add(ctx0, hp, ep);
+    cb(res_hc, "mtp_hc_init", il);
+
+    // one trunk block, verbatim minus PLE and minus the trunk's early row reduction
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = build_hc_mix(res_hc,
+            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
+            &inject, il);
+
+    ggml_build_forward_expand(gf, cur);
+
+    cur = build_layer_attn(inp_mem->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    cur = build_hc_mix(res_hc,
+            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
+            &inject, il);
+
+    cur = build_layer_ffn(cur, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+    cb(res_hc, "mtp_l_out", il);
+
+    // The head's own next hidden state is its pre-mixer residual. The draft context is fed masked, so the
+    // rows are reduced before they are handed back; mirror the trunk's rule for the unmasked case too.
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, hc_dim, n_tokens);
+
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        res->t_h_nextn = flat;
+        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+    } else {
+        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        res->t_h_nextn = flat;
+    }
+    cb(res->t_h_nextn, "h_nextn", -1);
+
+    res_hc = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);
+
+    // the head's mixer is its output norm: there is no separate one
+    cur = build_hc_mix(res_hc,
+            layer.nextn.hc_mix_norm, layer.nextn.hc_mix_down, layer.nextn.hc_mix_up,
+            nullptr, nullptr, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -797,7 +946,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
