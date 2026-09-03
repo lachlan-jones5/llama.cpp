@@ -496,6 +496,84 @@ static void test_reader_reads(int32_t n_threads) {
     fclose(f);
 }
 
+// Many small batches back to back, which is what speculative decoding produces: one resolve per layer per
+// draft step rather than one per token.
+//
+// A worker takes the batch under the reader's lock and then drains it with the lock released. If read_many()
+// could return between those two points, the next batch would be published while that worker was still
+// entering drain(), and the worker would then run the previous batch's request array against the new batch's
+// shared counters - consuming indices nobody reads and leaving the caller waiting on a count that can never
+// be reached. Observed as a hang with every thread parked on a futex and no I/O in flight.
+//
+// The batch sizes alternate deliberately: the hang needs a batch smaller than the one before it, so that the
+// late worker stops early and swallows an index the new batch still needs.
+static void test_reader_batch_handoff() {
+    printf("test_reader_batch_handoff\n");
+
+    FILE * f = make_pattern_file();
+    if (f == nullptr) {
+        printf("  SKIP: could not create a temporary file\n");
+        return;
+    }
+
+    {
+        llama_moe_reader reader;
+        CHECK(reader.start_workers(4) == LLAMA_MOE_STATUS_OK);
+
+        size_t idx = 0;
+        CHECK(reader.add_fd(fileno(f), TEST_FILE_SIZE, &idx) == LLAMA_MOE_STATUS_OK);
+
+        const size_t chunk    = 256;
+        const size_t n_rounds = 4000;
+
+        std::vector<uint8_t>            dst(chunk * 8, 0);
+        std::vector<llama_moe_read_req> reqs;
+
+        bool bad = false;
+
+        for (size_t r = 0; r < n_rounds && !bad; r++) {
+            // 2..8 and back, so consecutive batches differ in size in both directions
+            const size_t n = 2 + (r % 7);
+
+            std::fill(dst.begin(), dst.end(), 0);
+
+            reqs.clear();
+            for (size_t i = 0; i < n; i++) {
+                const size_t src = ((r + i) % 32) * chunk;
+                reqs.push_back({ 0, (uint64_t) src, dst.data() + i * chunk, chunk });
+            }
+
+            if (reader.read_many(reqs.data(), reqs.size()) != LLAMA_MOE_STATUS_OK) {
+                printf("  FAIL: round %zu reported an error\n", r);
+                n_fail++;
+                bad = true;
+                break;
+            }
+
+            // every destination must hold its own request's bytes, not another batch's
+            for (size_t i = 0; i < n && !bad; i++) {
+                const size_t src = ((r + i) % 32) * chunk;
+                for (size_t j = 0; j < chunk; j++) {
+                    if (dst[i * chunk + j] != pattern_at(src + j)) {
+                        printf("  FAIL: round %zu chunk %zu byte %zu mismatched\n", r, i, j);
+                        n_fail++;
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!bad) {
+            printf("  %zu batches handed off cleanly\n", n_rounds);
+        }
+
+        reader.shutdown();
+    }
+
+    fclose(f);
+}
+
 static void test_reader_bounds() {
     printf("test_reader_bounds\n");
 
@@ -683,6 +761,7 @@ int main() {
     test_reader_reads(0);
     test_reader_reads(1);
     test_reader_reads(4);
+    test_reader_batch_handoff();
     test_reader_bounds();
     test_reader_short_read();
     test_reader_batch_error_propagates();

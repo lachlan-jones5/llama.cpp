@@ -528,10 +528,23 @@ void llama_moe_reader::worker_loop() {
             seen = gen;
             reqs = cur_reqs;
             n    = cur_n;
+
+            // claimed under the same lock that publishes the batch, so read_many() cannot start the next
+            // one while this worker is still on its way into drain()
+            if (reqs != nullptr) {
+                n_active++;
+            }
         }
 
         if (reqs != nullptr) {
             drain(reqs, n);
+
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                n_active--;
+            }
+
+            cv_done.notify_all();
         }
     }
 }
@@ -608,7 +621,12 @@ llama_moe_status llama_moe_reader::read_many(const llama_moe_read_req * reqs, si
         {
             std::unique_lock<std::mutex> lock(mtx);
 
-            cv_done.wait(lock, [this] { return n_done.load(std::memory_order_acquire) >= cur_n; });
+            // Wait for the reads AND for every worker that took this batch to leave drain(). Waiting on
+            // n_done alone would let the next batch be published while a worker was still draining this
+            // one against counters that are about to be reset.
+            cv_done.wait(lock, [this] {
+                return n_done.load(std::memory_order_acquire) >= cur_n && n_active == 0;
+            });
 
             cur_reqs = nullptr;
             cur_n    = 0;

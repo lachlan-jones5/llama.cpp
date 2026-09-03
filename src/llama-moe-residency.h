@@ -250,6 +250,15 @@ private:
     size_t                     cur_n    = 0;
     uint64_t                   gen      = 0;  // bumped per batch so workers can tell batches apart
 
+    // Workers that have taken the current batch but have not finished draining it.
+    //
+    // A worker picks up the batch under mtx and then drains it with the lock released, so without this
+    // counter read_many() could return - and publish the next batch - while a worker was still between
+    // those two points. That worker would then drain the previous batch's request array against the new
+    // batch's shared counters, consume indices belonging to the new batch, and leave n_done short of
+    // cur_n, hanging the caller in cv_done.wait() with the reads never issued.
+    size_t n_active = 0;
+
     std::atomic<size_t>   next_idx {0};
     std::atomic<size_t>   n_done   {0};
     std::atomic<int>      first_err{(int) LLAMA_MOE_STATUS_OK};
