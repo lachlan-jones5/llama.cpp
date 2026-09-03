@@ -73,6 +73,11 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // False when the layer filter admitted nothing, e.g. a draft context whose only layer is a dense
+    // attention head. Such a cache tracks positions and holds no state, so there is nothing a partial
+    // removal would have to roll back.
+    bool has_state = false;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
