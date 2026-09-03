@@ -467,6 +467,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
+        // a view nothing below consumes: put it in the graph itself so the scheduler places it
+        ggml_build_forward_expand(gf, h_nextn);
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -612,6 +614,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res->t_h_nextn = flat;
     }
     cb(res->t_h_nextn, "h_nextn", -1);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
 
     res_hc = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);
 
