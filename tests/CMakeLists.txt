@@ -249,6 +249,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-paging-ple-gpu PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # greedy speculative decoding through the qwen4exp MTP head must reproduce plain greedy decoding
+    llama_build_and_test(test-speculative-mtp.cpp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-speculative-mtp PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
