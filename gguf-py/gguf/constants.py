@@ -1173,6 +1173,13 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_EMBED_TOKENS     = auto()
     NEXTN_ENORM            = auto()
     NEXTN_HNORM            = auto()
+    # qwen4exp: the head projects the hidden state and the token embedding separately rather than through
+    # one eh_proj over their concatenation, and collapses its hc-way residual with a mixer instead of a norm
+    NEXTN_FC_EMBD          = auto()
+    NEXTN_FC_HIDDEN        = auto()
+    NEXTN_HC_MIX_NORM      = auto()
+    NEXTN_HC_MIX_DOWN      = auto()
+    NEXTN_HC_MIX_UP        = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
     # eagle3
@@ -1950,6 +1957,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_EMBED_TOKENS:        "blk.{bid}.nextn.embed_tokens",
     MODEL_TENSOR.NEXTN_ENORM:               "blk.{bid}.nextn.enorm",
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
+    MODEL_TENSOR.NEXTN_FC_EMBD:             "blk.{bid}.nextn.fc_embd",
+    MODEL_TENSOR.NEXTN_FC_HIDDEN:           "blk.{bid}.nextn.fc_hidden",
+    MODEL_TENSOR.NEXTN_HC_MIX_NORM:         "blk.{bid}.nextn.hc_mix_norm",
+    MODEL_TENSOR.NEXTN_HC_MIX_DOWN:         "blk.{bid}.nextn.hc_mix_down",
+    MODEL_TENSOR.NEXTN_HC_MIX_UP:           "blk.{bid}.nextn.hc_mix_up",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
@@ -2866,6 +2878,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.QWEN4EXP: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT,
+        # the MTP head: one more decoder block past the main stack, plus its own input projection and
+        # output mixer; it shares the token embedding and the output head with the trunk
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_FC_EMBD,
+        MODEL_TENSOR.NEXTN_FC_HIDDEN,
+        MODEL_TENSOR.NEXTN_HC_MIX_NORM,
+        MODEL_TENSOR.NEXTN_HC_MIX_DOWN,
+        MODEL_TENSOR.NEXTN_HC_MIX_UP,
         # no OUTPUT_NORM / ATTN_NORM / ATTN_POST_NORM: hyper-connections replace every layer norm
         MODEL_TENSOR.HC_HEAD_NORM,
         MODEL_TENSOR.HC_HEAD_DOWN,

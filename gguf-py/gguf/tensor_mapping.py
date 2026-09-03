@@ -2689,6 +2689,27 @@ class TensorNameMap:
             "model.layers.{bid}.hnorm",
         ),
 
+        # qwen4exp: the converter rewrites the checkpoint's mtp.* tree onto these layer-indexed names
+        MODEL_TENSOR.NEXTN_FC_EMBD: (
+            "model.layers.{bid}.nextn_fc_embd",
+        ),
+
+        MODEL_TENSOR.NEXTN_FC_HIDDEN: (
+            "model.layers.{bid}.nextn_fc_hidden",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_MIX_NORM: (
+            "model.layers.{bid}.nextn_hc_mix.hc_norm",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_MIX_DOWN: (
+            "model.layers.{bid}.nextn_hc_mix.input_mix_weight_down",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_MIX_UP: (
+            "model.layers.{bid}.nextn_hc_mix.input_mix_weight_up",
+        ),
+
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
         ),

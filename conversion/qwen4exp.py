@@ -25,9 +25,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # The MTP head is exported through the inherited _QwenMtpMixin: mtp.layers.0.* becomes one more
+    # decoder block past the main stack, and the seven tensors the head keeps outside its layer are
+    # rewritten below onto layer-indexed nextn names. --no-mtp drops the head; --mtp-only keeps just it.
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -63,8 +63,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # one entry per block the loader will see, including the MTP head past the main stack: the head is
+        # a full-attention block with the same indexer geometry as the trunk's, so it takes the same ratio
         self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            [ratio if i >= n_layer or layer_types[i] == "full_attention" else 0 for i in range(self.block_count)]
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
@@ -104,6 +106,35 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if eos is None:
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+
+        # The head's own input projection and output mixer. qwen35 has one eh_proj over the concatenation
+        # of hidden and embedding; this head projects them separately and adds. It has no final norm
+        # either - its hc mixer collapses the residual streams, exactly as the trunk's head mixer does.
+        # These names are what tensor_mapping expects for the NEXTN_* types; the mixin's own remapper
+        # handles pre_fc_norm_{embedding,hidden} -> {enorm,hnorm}.
+        if name.startswith("mtp.") and cls._original_block_count is not None:
+            bid = cls._original_block_count
+            rewrite = {
+                "mtp.fc_embedding":                                   f"model.layers.{bid}.nextn_fc_embd",
+                "mtp.fc_hidden":                                      f"model.layers.{bid}.nextn_fc_hidden",
+                "mtp.hyper_connection_mixer.hc_norm":                 f"model.layers.{bid}.nextn_hc_mix.hc_norm",
+                "mtp.hyper_connection_mixer.input_mix_weight_down":   f"model.layers.{bid}.nextn_hc_mix.input_mix_weight_down",
+                "mtp.hyper_connection_mixer.input_mix_weight_up":     f"model.layers.{bid}.nextn_hc_mix.input_mix_weight_up",
+            }
+            base, dot, suffix = name.rpartition(".")
+            key = base if suffix in ("weight", "bias") else name
+            if key in rewrite:
+                if cls.no_mtp:
+                    return None
+                name = rewrite[key] + (dot + suffix if key != name else "")
+
+        return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
