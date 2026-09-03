@@ -1456,12 +1456,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    // A slot pool that could not be bound leaves the graph pointing at a paged tensor with no storage, and
-    // the embedding rows are resolved from set_inputs() just above, so both are covered by checking here.
-    // Checked here rather than next to the graph build so that a reused graph is covered too.
-    if (moe_res && moe_res->error() != LLAMA_MOE_STATUS_OK) {
-        LLAMA_LOG_ERROR("%s: MoE expert paging failed: %s (%s)\n", __func__,
+    // Expert paging can fail at two points in a ubatch, and both have to fail *this* decode.
+    //
+    // Before compute: a slot pool that could not be bound leaves the graph pointing at a paged tensor with
+    // no storage, and the embedding rows are resolved on the host from set_inputs() just above. Checked here
+    // rather than next to the graph build so that a reused graph is covered too.
+    //
+    // After compute: the expert resolve is a graph node, so a read that fails mid-graph is only latched
+    // once compute is under way. The failing group's ids are pointed at slot 0 so nothing runs out of
+    // bounds, but the logits that come out are computed on whatever slot 0 holds. Without this check the
+    // decode returned success on those logits and the error surfaced one decode later, naming the wrong one.
+    //
+    // The latch is cleared once reported. Residency was dropped for the affected layer when it was
+    // latched, so the next decode re-reads what it needs; a transient I/O error costs one failed decode
+    // rather than every decode after it. A pool that cannot be bound at all fails again on the next graph
+    // build, with the same message, which is the right outcome.
+    auto moe_failed = [&](const char * when) {
+        if (moe_res == nullptr || moe_res->error() == LLAMA_MOE_STATUS_OK) {
+            return false;
+        }
+        LLAMA_LOG_ERROR("%s: MoE expert paging failed %s: %s (%s)\n", __func__, when,
                 llama_moe_status_str(moe_res->error()), moe_res->error_detail().c_str());
+        moe_res->clear_error();
+        return true;
+    };
+
+    if (moe_failed("before compute")) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -1470,6 +1490,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        return nullptr;
+    }
+
+    if (moe_failed("during compute")) {
+        ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 

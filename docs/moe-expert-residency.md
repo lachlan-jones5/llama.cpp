@@ -441,9 +441,13 @@ Only the expert matmuls are indexed by slot. Routing weights, per-expert biases,
 weights are all still sized by `n_expert` and keep indexing by expert id.
 
 Reads are positional and bounds-checked against the file length. A pool that cannot be allocated, an
-out-of-range expert id, a truncated file or a failed read all fail the decode with a propagated error - never
-an abort, never a silent fallback to a different slot count or backend, and never a partially filled slot
-presented as valid.
+out-of-range expert id, a truncated file or a failed read all fail *that* decode with a propagated error -
+never an abort, never a silent fallback to a different slot count or backend, and never a partially filled
+slot presented as valid. The expert resolve runs inside the graph, so a read that fails mid-compute is
+checked for after compute as well as before; without that check the decode returned success on logits
+computed from slot 0. A failure drops residency for the layer it hit and the error is cleared once reported,
+so a transient I/O error costs one failed decode, not every decode after it: once the file is whole again the
+same context re-reads and continues.
 
 ### The per-layer embedding table
 

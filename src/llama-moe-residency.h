@@ -351,8 +351,8 @@ struct llama_moe_residency {
     // ids and out_slots both hold n entries. Runs the policy, then the reads.
     //
     // On failure every entry of out_slots is set to 0. Slot 0 always exists, so the matmul that follows
-    // reads in-bounds nonsense rather than running off the end of the pool; the error is latched and the
-    // decode is failed once the graph finishes.
+    // reads in-bounds nonsense rather than running off the end of the pool; the error is latched, and the
+    // context checks the latch after compute so that this decode - not the next one - is the one that fails.
     llama_moe_status resolve(int32_t il, const int32_t * ids, int32_t n, int32_t * out_slots);
 
     // Stable per-layer handle for the graph node that performs the resolve. Valid until shutdown.

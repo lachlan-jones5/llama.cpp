@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -280,6 +282,89 @@ int main(int argc, char ** argv) {
                 CHECK(err < 1e-6);
             }
         }
+    }
+
+    // A read that fails mid-graph must fail THAT decode. The expert resolve runs inside the graph, so the
+    // failure is only latched during compute; checking the latch only before compute let the decode return
+    // success on logits computed from slot 0, with the error surfacing one decode later. And a failure must
+    // not poison the context: residency is dropped for the affected layer, so once the file is whole again
+    // the next decode should simply re-read and succeed.
+    printf("truncated backing file\n");
+    {
+        namespace fs = std::filesystem;
+
+        const fs::path copy = fs::temp_directory_path() / "test-moe-paging-truncated.gguf";
+        std::error_code ec;
+        fs::copy_file(path, copy, fs::copy_options::overwrite_existing, ec);
+        CHECK(!ec);
+
+        if (!ec) {
+            llama_model_params mparams = llama_model_default_params();
+            mparams.n_gpu_layers = g_n_gpu_layers;
+            mparams.moe.n_slots  = 1;  // one slot, two experts: nearly every routed id is a miss and a read
+
+            llama_model * model = llama_model_load_from_file(copy.string().c_str(), mparams);
+            CHECK(model != nullptr);
+
+            // The whole 12-token batch must be ONE ubatch. With several, the next ubatch's pre-compute check
+            // catches what the previous one latched during compute, and the missing post-compute check is
+            // masked. One ubatch is also the common case: a single generated token.
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx    = 64;
+            cparams.n_batch  = 32;
+            cparams.n_ubatch = 32;
+            cparams.no_perf  = true;
+
+            llama_context * ctx = model ? llama_init_from_model(model, cparams) : nullptr;
+            CHECK(ctx != nullptr);
+
+            if (ctx) {
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+                auto decode_some = [&](int seed) {
+                    llama_batch batch = llama_batch_init(12, 0, 1);
+                    for (int i = 0; i < 12; i++) {
+                        common_batch_add(batch, (llama_token) ((i * 7 + seed) % n_vocab), (llama_pos) i, {0}, true);
+                    }
+                    const int rc = llama_decode(ctx, batch);
+                    llama_batch_free(batch);
+                    llama_memory_clear(llama_get_memory(ctx), true);
+                    return rc;
+                };
+
+                // whole file: fine
+                CHECK(decode_some(1) == 0);
+
+                // cut the file in half behind the reader's back; every expert read past the cut comes up short
+                const auto full = fs::file_size(copy);
+                fs::resize_file(copy, full / 2, ec);
+                CHECK(!ec);
+
+                const int rc_cut = decode_some(2);
+                printf("  decode with the file truncated: rc = %d (%s)\n", rc_cut, rc_cut != 0 ? "failed, correct" : "SUCCEEDED - BAD");
+                CHECK(rc_cut != 0);
+
+                // put the bytes back and the same context must recover without being recreated
+                {
+                    std::ifstream in(path, std::ios::binary);
+                    std::ofstream out(copy, std::ios::binary | std::ios::trunc);
+                    out << in.rdbuf();
+                }
+                CHECK(fs::file_size(copy) == full);
+
+                const int rc_back = decode_some(3);
+                printf("  decode with the file restored: rc = %d (%s)\n", rc_back, rc_back == 0 ? "recovered" : "STILL FAILING - BAD");
+                CHECK(rc_back == 0);
+
+                llama_free(ctx);
+            }
+
+            if (model) {
+                llama_model_free(model);
+            }
+        }
+
+        fs::remove(copy, ec);
     }
 
     // A ubatch of N tokens can route to n_expert_used*N distinct experts, all of which must be resident at
