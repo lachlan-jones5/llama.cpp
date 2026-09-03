@@ -333,7 +333,10 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    // The input is created whenever the memory has a recurrent half, but a graph that touches no recurrent
+    // layer - an MTP draft head that is a dense-attention block on a hybrid model - never consumes it, so
+    // the scheduler never allocates it and there is nothing to fill.
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -1101,7 +1104,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // see llm_graph_input_rs::set_input: an input the graph never consumed is never allocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1145,7 +1149,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // see llm_graph_input_rs::set_input: an input the graph never consumed is never allocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1219,7 +1224,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // see llm_graph_input_rs::set_input: an input the graph never consumed is never allocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
