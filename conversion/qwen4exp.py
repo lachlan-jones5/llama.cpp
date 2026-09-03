@@ -26,8 +26,16 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
     # The MTP head is exported through the inherited _QwenMtpMixin: mtp.layers.0.* becomes one more
-    # decoder block past the main stack, and the seven tensors the head keeps outside its layer are
-    # rewritten below onto layer-indexed nextn names. --no-mtp drops the head; --mtp-only keeps just it.
+    # decoder block past the main stack. Of the seven tensors the head keeps outside its layer, the two
+    # pre-fc norms are the mixin's own enorm/hnorm; these three are where this head differs from qwen35's -
+    # it projects the hidden state and the embedding separately rather than through one eh_proj over their
+    # concatenation, and it has no final norm, its own hc mixer collapsing the streams instead. The names
+    # are what tensor_mapping expects for the NEXTN_* types. --no-mtp drops the head; --mtp keeps just it.
+    mtp_extra_remap = {
+        "fc_embedding":           "nextn_fc_embd",
+        "fc_hidden":              "nextn_fc_hidden",
+        "hyper_connection_mixer": "nextn_hc_mix",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,32 +115,22 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
+    # the int64 PLE constants set_gguf_parameters reads; they become metadata, never tensors
+    _ple_constants = (
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_offsets",
+        "ple_embedding.ngram_heads_vocab_sizes",
+    )
+
     @classmethod
     def filter_tensors(cls, item):
         name, gen = item
-        if name.startswith("model.mtp."):
-            name = name.replace("model.", "", 1)
 
-        # The head's own input projection and output mixer. qwen35 has one eh_proj over the concatenation
-        # of hidden and embedding; this head projects them separately and adds. It has no final norm
-        # either - its hc mixer collapses the residual streams, exactly as the trunk's head mixer does.
-        # These names are what tensor_mapping expects for the NEXTN_* types; the mixin's own remapper
-        # handles pre_fc_norm_{embedding,hidden} -> {enorm,hnorm}.
-        if name.startswith("mtp.") and cls._original_block_count is not None:
-            bid = cls._original_block_count
-            rewrite = {
-                "mtp.fc_embedding":                                   f"model.layers.{bid}.nextn_fc_embd",
-                "mtp.fc_hidden":                                      f"model.layers.{bid}.nextn_fc_hidden",
-                "mtp.hyper_connection_mixer.hc_norm":                 f"model.layers.{bid}.nextn_hc_mix.hc_norm",
-                "mtp.hyper_connection_mixer.input_mix_weight_down":   f"model.layers.{bid}.nextn_hc_mix.input_mix_weight_down",
-                "mtp.hyper_connection_mixer.input_mix_weight_up":     f"model.layers.{bid}.nextn_hc_mix.input_mix_weight_up",
-            }
-            base, dot, suffix = name.rpartition(".")
-            key = base if suffix in ("weight", "bias") else name
-            if key in rewrite:
-                if cls.no_mtp:
-                    return None
-                name = rewrite[key] + (dot + suffix if key != name else "")
+        # A head-only export keeps just the head, the token embedding and the output head, but the PLE
+        # metadata is written from these constants and the mixin's keep-set does not know them. They are a
+        # few dozen integers; keeping them makes the head-only file's metadata a faithful copy of the trunk's.
+        if cls.mtp_only and name.endswith(cls._ple_constants):
+            return name, gen
 
         return super().filter_tensors((name, gen))
 

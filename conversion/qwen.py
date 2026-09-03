@@ -293,6 +293,12 @@ class _QwenMtpMixin:
     _original_block_count: int | None = None
     opt_num_mtp_layers: int = 0
 
+    # Head tensors that live directly under mtp.* rather than mtp.layers.N.*, beyond the four every Qwen
+    # head has: {checkpoint name: layer-indexed name}. A subclass whose head is shaped differently adds its
+    # own here and they flow through the same remap as fc/enorm/hnorm - kept in a head-only export, dropped
+    # by --no-mtp.
+    mtp_extra_remap: dict[str, str] = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_count = self.hparams["num_hidden_layers"]
@@ -329,6 +335,7 @@ class _QwenMtpMixin:
                 "pre_fc_norm_embedding": "enorm",
                 "pre_fc_norm_hidden":    "hnorm",
                 "norm":                  "shared_head.norm",
+                **cls.mtp_extra_remap,
             }
             parts = name.split(".", 3)
             if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
