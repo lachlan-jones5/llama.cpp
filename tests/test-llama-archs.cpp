@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -143,8 +144,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    // qwen4exp carries an MTP draft head: one more block past the main stack. The loader sees it in the
+    // block count and n_layer() subtracts it back out, so n_layer keeps meaning the trunk below.
+    const uint32_t n_layer_nextn = arch == LLM_ARCH_QWEN4EXP ? 1 : 0;
+
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + n_layer_nextn);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (n_layer_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,  n_layer_nextn);
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -261,8 +269,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (arch == LLM_ARCH_QWEN4EXP) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
-        // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        // without this the QSA layers fall back to dense and go uncovered; the loader reads one entry per
+        // block including the head, which is a full-attention block with the trunk's indexer geometry
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer + n_layer_nextn, 4));
 
         // Per-layer embeddings. Without these hparams ple_n_heads stays 0, build_inp_ple is skipped
         // entirely, and the whole PLE path - including its per-layer tensors and the shared n-gram table -
@@ -413,6 +422,17 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+static llama_context_params make_ctx_params(bool encode) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 0;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    if (!encode) {
+        ctx_params.n_ubatch = 64;
+    }
+    return ctx_params;
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
@@ -423,14 +443,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    // A model built without a file cannot skip tensors, so any MTP head a fixture declares has to be
+    // loaded. Harmless for the fixtures that declare none.
+    model_params.load_mtp = true;
 
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 0;
-    ctx_params.n_threads = 4;
-    ctx_params.n_threads_batch = 4;
-    if (!encode) {
-        ctx_params.n_ubatch = 64;
-    }
+    llama_context_params ctx_params = make_ctx_params(encode);
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -475,6 +492,70 @@ static std::vector<float> get_logits(
         for (uint32_t j = 0; j < n_vocab; j++) {
             ret.push_back(logits_ith[j]);
         }
+    }
+    llama_batch_free(batch);
+    return ret;
+}
+
+// Run the MTP draft head the way the speculative driver does: the trunk decodes the tokens and hands over
+// its hidden rows, then the head, in its own context, is fed each token together with the hidden row of the
+// token before it and predicts the one after. Returns the head's logits followed by the head's own hidden
+// rows, so a device that drifts in either is caught.
+static std::vector<float> get_logits_mtp(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+    const uint32_t n_embd_h = llama_model_n_embd_nextn(model);
+    GGML_ASSERT(n_tokens >= 2);
+
+    // the trunk, unmasked: one hidden row for every token
+    llama_set_embeddings_nextn(lctx, true, /*masked*/ false);
+    {
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (uint32_t pos = 0; pos < n_tokens; pos++) {
+            common_batch_add(batch, tokens[pos], pos, {0}, true);
+        }
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode the trunk batch");
+        }
+        llama_batch_free(batch);
+    }
+
+    // the head, in a context of its own, masked: hidden rows only for the output tokens
+    llama_context_params ctx_params = make_ctx_params(false);
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    llama_context_ptr lctx_mtp(llama_init_from_model(model, ctx_params));
+    if (!lctx_mtp) {
+        throw std::runtime_error("failed to create the MTP context");
+    }
+    llama_set_embeddings_nextn(lctx_mtp.get(), true, /*masked*/ true);
+
+    // row i pairs token i+1 with the trunk's hidden row for token i; the batch needs both arrays
+    const uint32_t n_mtp = n_tokens - 1;
+    llama_batch batch = llama_batch_init(n_mtp, n_embd_h, 1);
+    batch.token = (llama_token *) malloc(sizeof(llama_token) * n_mtp);
+    for (uint32_t i = 0; i < n_mtp; i++) {
+        common_batch_add(batch, tokens[i + 1], i, {0}, true);
+        const float * h = llama_get_embeddings_nextn_ith(lctx, i);
+        GGML_ASSERT(h != nullptr);
+        memcpy(batch.embd + (size_t) i * n_embd_h, h, n_embd_h * sizeof(float));
+    }
+    if (llama_decode(lctx_mtp.get(), batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode the MTP batch");
+    }
+
+    std::vector<float> ret;
+    ret.reserve((size_t) n_mtp * (n_vocab + n_embd_h));
+    for (uint32_t i = 0; i < n_mtp; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx_mtp.get(), i);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    for (uint32_t i = 0; i < n_mtp; i++) {
+        const float * h = llama_get_embeddings_nextn_ith(lctx_mtp.get(), i);
+        GGML_ASSERT(h != nullptr);
+        ret.insert(ret.end(), h, h + n_embd_h);
     }
     llama_batch_free(batch);
     return ret;
@@ -742,14 +823,23 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (bool moe : {false, true}) {
+        // The MTP row reuses the MoE fixture and runs its draft head instead of the trunk, on the archs
+        // whose fixture declares one.
+        enum test_config { CFG_DENSE, CFG_MOE, CFG_MTP };
+
+        for (test_config cfg : {CFG_DENSE, CFG_MOE, CFG_MTP}) {
+            const bool moe = cfg != CFG_DENSE;
+            const bool mtp = cfg == CFG_MTP;
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
             if (!moe && moe_mandatory(arch)) {
                 continue;
             }
-            const std::string config_name = moe ? "MoE" : "Dense";
+            if (mtp && arch != LLM_ARCH_QWEN4EXP) {
+                continue;
+            }
+            const std::string config_name = mtp ? "MTP" : moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
@@ -769,13 +859,16 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 char nmse_str[12] = {0};
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
+                    auto run = [&](llama_model * model, llama_context * lctx) {
+                        return mtp ? get_logits_mtp(model, lctx, tokens) : get_logits(model, lctx, tokens, encode);
+                    };
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        logits_cpu = run(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get());
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        logits_dev = run(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get());
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -797,8 +890,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         rewind(file);
 
                         auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
-                        const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                        const std::vector<float> logits_roundtrip = run(
+                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get());
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
