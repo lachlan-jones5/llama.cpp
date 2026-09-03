@@ -14,6 +14,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+
+#ifdef _WIN32
+#   include <process.h>
+#   define getpid _getpid
+#else
+#   include <unistd.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -293,7 +300,9 @@ int main(int argc, char ** argv) {
     {
         namespace fs = std::filesystem;
 
-        const fs::path copy = fs::temp_directory_path() / "test-moe-paging-truncated.gguf";
+        // four registrations of this test run in parallel under ctest; each needs its own copy to maim
+        const fs::path copy = fs::temp_directory_path() /
+            ("test-moe-paging-truncated-" + std::to_string((long long) getpid()) + ".gguf");
         std::error_code ec;
         fs::copy_file(path, copy, fs::copy_options::overwrite_existing, ec);
         CHECK(!ec);
@@ -335,9 +344,11 @@ int main(int argc, char ** argv) {
                 // whole file: fine
                 CHECK(decode_some(1) == 0);
 
-                // cut the file in half behind the reader's back; every expert read past the cut comes up short
+                // Cut the file down to almost nothing behind the reader's back, so every expert read comes
+                // up short wherever the experts sit in the file - a fixture with a draft head appended
+                // keeps its trunk experts well inside the first half, so a half cut would miss them.
                 const auto full = fs::file_size(copy);
-                fs::resize_file(copy, full / 2, ec);
+                fs::resize_file(copy, 64 * 1024, ec);
                 CHECK(!ec);
 
                 const int rc_cut = decode_some(2);
