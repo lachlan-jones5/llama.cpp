@@ -2500,17 +2500,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        // A qwen4exp MTP context runs the draft head as one more trunk layer, with its own
+                        // attention and indexer caches, so it takes the block(s) past the main stack and
+                        // nothing of the trunk. The recurrent filter then admits no layer at all, which the
+                        // recurrent cache handles as a cache with positions but no state. The other archs
+                        // here take the plain-KV route above for their MTP contexts.
+                        const bool mtp_head = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP;
+
+                        auto in_scope = [this, mtp_head](uint32_t il) {
+                            return mtp_head ? il >= hparams.n_layer() : il < hparams.n_layer();
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+
+                        filter_attn = [&, in_scope](uint32_t il) {
+                            return in_scope(il) && !hparams.is_recr(il);
+                        };
+                        filter_recr = [&, in_scope](uint32_t il) {
+                            return in_scope(il) && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            filter_idx = [&, in_scope](uint32_t il) {
+                                return in_scope(il) && !hparams.is_recr(il);
                             };
                         }
                     }
