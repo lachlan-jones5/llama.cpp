@@ -92,8 +92,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         _img = self._image_token_id()
         if _img is not None:
             self.gguf_writer.add_ple_image_token_id(int(_img))
+        # The loader requires the row width whenever the PLE keys are present. The config carries it
+        # unconditionally; the table's shards, when this export sees them, must agree - a head-only export
+        # never sees them (the table is a trunk tensor) and so cannot derive it from a shape.
+        ple_dim = hp.get("ple_embed_dim")
         if self._ple_row_dim is not None:
-            self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
+            if ple_dim is not None and int(ple_dim) != self._ple_row_dim:
+                raise ValueError(
+                    f"PLE row dim {self._ple_row_dim} from the table disagrees with ple_embed_dim {ple_dim} in the config")
+            ple_dim = self._ple_row_dim
+        if ple_dim is None:
+            raise ValueError("PLE row dim: neither ple_embed_dim in the config nor a table shard was seen")
+        self.gguf_writer.add_embedding_length_per_layer_input(int(ple_dim))
 
         self.gguf_writer.add_ple_layer_multipliers(
             self._read_hash_constants("ple_embedding.layer_multipliers"))
