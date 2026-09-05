@@ -529,6 +529,55 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    // Some Anthropic clients (Claude Code among them) send additional
+    // system-role messages inside `messages`, often as the last entry.
+    // Chat templates that require a single leading system message (Qwen
+    // and other strict families) reject anything else, so fold every
+    // system message into one at the front and keep the order of the
+    // remaining messages.
+    json system_texts = json::array();
+    json non_system = json::array();
+    for (const auto & msg : oai_messages) {
+        if (json_value(msg, "role", std::string()) != "system") {
+            non_system.push_back(msg);
+            continue;
+        }
+        if (!msg.contains("content")) {
+            continue;
+        }
+        const json & content = msg.at("content");
+        if (content.is_string()) {
+            if (!content.get<std::string>().empty()) {
+                system_texts.push_back(content);
+            }
+        } else if (content.is_array()) {
+            std::string text;
+            for (const auto & block : content) {
+                if (json_value(block, "type", std::string()) == "text") {
+                    text += json_value(block, "text", std::string());
+                }
+            }
+            if (!text.empty()) {
+                system_texts.push_back(text);
+            }
+        }
+    }
+    json merged_messages = json::array();
+    if (!system_texts.empty()) {
+        std::string merged;
+        for (const auto & text : system_texts) {
+            if (!merged.empty()) {
+                merged += "\n\n";
+            }
+            merged += text.get<std::string>();
+        }
+        merged_messages.push_back({{"role", "system"}, {"content", merged}});
+    }
+    for (const auto & msg : non_system) {
+        merged_messages.push_back(msg);
+    }
+    oai_messages = std::move(merged_messages);
+
     oai_body["messages"] = oai_messages;
 
     // Convert tools
